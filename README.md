@@ -1,2 +1,3 @@
 # Electric-piano-tuning
 The entire adjustment mechanism automatically rotates around an axis fixed to the cast-iron frame, thereby driving the tuning wrench to rotate around the piano's tuning pin and enabling precise tuning.
+A mobile phone utilizes a Bluetooth module to drive a low-power 12V brushed motor—connected to a Bluetooth control board—to achieve forward and reverse rotation. The motor is mounted on the piano's cast-iron frame, with the tuning lever positioned within the motor's U-shaped slot; the motor's linear motion drives the movement of the lever. The entire adjustment mechanism automatically rotates around an axis fixed to the cast-iron frame, thereby driving the tuning wrench to rotate around the piano's tuning pin and enabling precise tuning.
