@@ -1,3 +1,23 @@
-# Electric-piano-tuning
-The entire adjustment mechanism automatically rotates around an axis fixed to the cast-iron frame, thereby driving the tuning wrench to rotate around the piano's tuning pin and enabling precise tuning.
-A mobile phone utilizes a Bluetooth module to drive a low-power 12V brushed motor—connected to a Bluetooth control board—to achieve forward and reverse rotation. The motor is mounted on the piano's cast-iron frame, with the tuning lever positioned within the motor's U-shaped slot; the motor's linear motion drives the movement of the lever. The entire adjustment mechanism automatically rotates around an axis fixed to the cast-iron frame, thereby driving the tuning wrench to rotate around the piano's tuning pin and enabling precise tuning.
+# 蓝牙电机测试 APP
+
+这是一个 Android Studio 测试项目，用来扫描 BLE 电机控制板、连接设备、发现可写特征，并发送十六进制控制指令。
+
+## 使用步骤
+
+1. 用 Android Studio 打开本目录。
+2. 等待 Gradle Sync 完成。
+3. 用 USB 连接安卓真机，打开开发者模式和 USB 调试。
+4. 安装运行 APP。
+5. 点击“扫描”，APP 会优先选择 `JUXUN-88888888` 或地址 `DE:AB:BD:EA:2F:DE`。
+6. 点击“连接”，连接成功后选择可写特征。
+7. 在正转、停止、反转输入框里填写十六进制指令后测试。
+
+当前还不知道厂家的真实协议，所以默认指令只是占位值：
+
+```text
+正转: 01
+停止: 00
+反转: 02
+```
+
+如果电机有负载，第一次测试建议断开电机或限流供电，避免误动作。
