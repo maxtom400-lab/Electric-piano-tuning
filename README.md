@@ -10,6 +10,7 @@ The app combines:
 - BLE control for a 12V geared motor board
 - left/right limit switch handling
 - safe hold-to-run motor controls
+- guarded automatic tuning pulses for the selected key
 
 ## Hardware
 
@@ -37,6 +38,14 @@ The workflow records all keys from `A0` to `C8`. Each key requires 3 stable pitc
 After all 88 keys are recorded, tap `Compute Tuning` to enable a lightweight stretch tuning map. The current implementation is intentionally simple and can later be replaced with full spectral/inharmonicity analysis similar to Entropy Piano Tuner.
 
 See [`RECORDING_WORKFLOW.md`](RECORDING_WORKFLOW.md).
+
+## Auto Tuning
+
+Open the top-left menu and tap `Auto Tune Selected Key`.
+
+The app only starts or continues automatic motor pulses after it hears a stable pitch near the selected key. This avoids using room noise or a wrong piano key as the tuning signal. If the sound is not stable, the auto workflow waits and asks you to play the selected key again.
+
+Use `Stop Auto Tune` from the menu to cancel the automatic workflow. Limit switch notifications still stop the motor and block that direction until the opposite direction is used.
 
 ## BLE Heartbeat
 
