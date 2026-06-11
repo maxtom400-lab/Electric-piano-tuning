@@ -49,6 +49,17 @@ The app only starts or continues automatic motor pulses after it hears a stable 
 
 Use `Stop Auto Tune` from the menu to cancel the automatic workflow. Limit switch notifications still stop the motor and block that direction until the opposite direction is used.
 
+Before auto tuning starts, the app shows a safety confirmation checklist for bracket locking, limit switches, manual direction testing, and selected-key pitch stability.
+
+Use `Calibration` from the same menu to adjust and save:
+
+- motor speed percent
+- probe pulse length
+- long / medium / short auto pulse lengths
+- settle time after each pulse
+- maximum auto steps
+- done tolerance in cents
+
 ## BLE Heartbeat
 
 After a successful BLE connection and initialization, the app sends a safe heartbeat packet every 10 minutes:

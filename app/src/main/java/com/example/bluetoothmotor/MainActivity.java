@@ -41,6 +41,7 @@ import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.text.InputFilter;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -174,6 +175,14 @@ public class MainActivity extends Activity {
     private Direction autoRaiseDirection = Direction.NONE;
     private Direction autoLowerDirection = Direction.NONE;
     private int autoStepCount;
+    private int autoSpeedPercent = 50;
+    private int autoProbeMs = 350;
+    private int autoPulseLongMs = 450;
+    private int autoPulseMediumMs = 250;
+    private int autoPulseShortMs = 120;
+    private int autoSettleMs = 1400;
+    private int autoMaxStepsSetting = AUTO_MAX_STEPS;
+    private double autoToleranceCents = AUTO_TOLERANCE_CENTS;
     private boolean keyPreviewEnabled;
     private long lastRangeAlarmVibrateMs;
     private AlertDialog pianoScanDialog;
@@ -298,7 +307,7 @@ public class MainActivity extends Activity {
             if (status == BluetoothGatt.GATT_SUCCESS && CCCD_UUID.equals(descriptor.getUuid())) {
                 sendCommandFromGattCallback("INIT", CMD_INIT);
                 scheduleCommand("AUTO JOG", CMD_MODE_JOG, 180L);
-                scheduleCommand("AUTO SPEED50", CMD_SPEED_50, 360L);
+                scheduleCommand("AUTO SPEED" + autoSpeedPercent, speedCommandForPercent(autoSpeedPercent), 360L);
                 runOnUiThread(() -> startHeartbeat());
                 runOnUiThread(() -> dismissMotorDialog());
                 runOnUiThread(() -> setStatus("Connected: auto ready sent"));
@@ -377,6 +386,7 @@ public class MainActivity extends Activity {
         scanner = adapter == null ? null : adapter.getBluetoothLeScanner();
         pianoKeyPlayer = new PianoKeyPlayer(this);
         loadPianoScanData();
+        loadCalibrationSettings();
 
         setContentView(buildContentView());
         requestNeededPermissions();
@@ -575,12 +585,16 @@ public class MainActivity extends Activity {
         panel.addView(record88);
 
         Button auto = popupButton("Auto Tune Selected Key");
-        auto.setOnClickListener(v -> startAutoTune());
+        auto.setOnClickListener(v -> showAutoSafetyDialog());
         panel.addView(auto);
 
         Button stopAuto = popupButton("Stop Auto Tune");
         stopAuto.setOnClickListener(v -> stopAutoTune(true));
         panel.addView(stopAuto);
+
+        Button calibration = popupButton("Calibration");
+        calibration.setOnClickListener(v -> showCalibrationDialog());
+        panel.addView(calibration);
 
         Button about = popupButton("About");
         about.setOnClickListener(v -> showAboutDialogClean());
@@ -608,6 +622,93 @@ public class MainActivity extends Activity {
                 .setMessage("The motor is a 12V gear motor with a speed of 90 RPM. On the app's tuning dial, the 12 o'clock position (zero mark) indicates correct pitch; the range extends 170 degrees to the left and 170 degrees to the right, representing the full tuning span. The app will trigger an alarm if these limits are exceeded, so please adjust carefully - I accept no liability for broken strings.\n\nTORY HIGH SCHOOL MAX.YING 2026.")
                 .setPositiveButton("OK", null)
                 .show();
+    }
+
+    private void showAutoSafetyDialog() {
+        String note = noteName(selectedTargetMidi);
+        new AlertDialog.Builder(this)
+                .setTitle("Auto Tune Safety")
+                .setMessage("Before starting automatic tuning:\n\n"
+                        + "1. The piano rib bracket is locked and cannot slide.\n"
+                        + "2. Left and right limit switches have been tested.\n"
+                        + "3. Manual HOLD LEFT and HOLD RIGHT work correctly.\n"
+                        + "4. The selected key is " + note + ". Play this key until the pitch display is stable.\n\n"
+                        + "Auto mode sends short motor pulses. Stop immediately if the mechanism moves unexpectedly.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Start Auto Tune", (dialog, which) -> startAutoTune())
+                .show();
+    }
+
+    private void showCalibrationDialog() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(18), dp(14), dp(18), dp(14));
+        panel.setBackgroundColor(Color.rgb(232, 198, 139));
+
+        EditText speed = numberEditText(autoSpeedPercent);
+        EditText probe = numberEditText(autoProbeMs);
+        EditText pulseLong = numberEditText(autoPulseLongMs);
+        EditText pulseMedium = numberEditText(autoPulseMediumMs);
+        EditText pulseShort = numberEditText(autoPulseShortMs);
+        EditText settle = numberEditText(autoSettleMs);
+        EditText maxSteps = numberEditText(autoMaxStepsSetting);
+        EditText tolerance = decimalEditText(autoToleranceCents);
+
+        panel.addView(label("Speed percent (1-100)"));
+        panel.addView(speed);
+        panel.addView(label("Probe pulse ms"));
+        panel.addView(probe);
+        panel.addView(label("Long pulse ms (>25 cents)"));
+        panel.addView(pulseLong);
+        panel.addView(label("Medium pulse ms (10-25 cents)"));
+        panel.addView(pulseMedium);
+        panel.addView(label("Short pulse ms (<10 cents)"));
+        panel.addView(pulseShort);
+        panel.addView(label("Settle time after pulse ms"));
+        panel.addView(settle);
+        panel.addView(label("Max auto steps"));
+        panel.addView(maxSteps);
+        panel.addView(label("Done tolerance cents"));
+        panel.addView(tolerance);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Calibration")
+                .setView(panel)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Defaults", (dialog, which) -> {
+                    resetCalibrationDefaults();
+                    saveCalibrationSettings();
+                    toast("Calibration defaults restored");
+                })
+                .setPositiveButton("Save", (dialog, which) -> {
+                    autoSpeedPercent = clampInt(parseInt(speed, autoSpeedPercent), 1, 100);
+                    autoProbeMs = clampInt(parseInt(probe, autoProbeMs), 80, 1500);
+                    autoPulseLongMs = clampInt(parseInt(pulseLong, autoPulseLongMs), 80, 1500);
+                    autoPulseMediumMs = clampInt(parseInt(pulseMedium, autoPulseMediumMs), 60, 1000);
+                    autoPulseShortMs = clampInt(parseInt(pulseShort, autoPulseShortMs), 40, 800);
+                    autoSettleMs = clampInt(parseInt(settle, autoSettleMs), 500, 5000);
+                    autoMaxStepsSetting = clampInt(parseInt(maxSteps, autoMaxStepsSetting), 3, 120);
+                    autoToleranceCents = clampDouble(parseDouble(tolerance, autoToleranceCents), 0.5, 20.0);
+                    saveCalibrationSettings();
+                    toast("Calibration saved");
+                })
+                .show();
+    }
+
+    private EditText numberEditText(int value) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setText(String.valueOf(value));
+        input.setInputType(InputType.TYPE_CLASS_NUMBER);
+        return input;
+    }
+
+    private EditText decimalEditText(double value) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setText(String.format(Locale.US, "%.1f", value));
+        input.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        return input;
     }
 
     private void showPianoScanDialog() {
@@ -878,12 +979,80 @@ public class MainActivity extends Activity {
         pianoScanMidi = Math.max(21, Math.min(108, pianoScanMidi));
     }
 
+    private void loadCalibrationSettings() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        autoSpeedPercent = clampInt(prefs.getInt("auto_speed_percent", autoSpeedPercent), 1, 100);
+        autoProbeMs = clampInt(prefs.getInt("auto_probe_ms", autoProbeMs), 80, 1500);
+        autoPulseLongMs = clampInt(prefs.getInt("auto_pulse_long_ms", autoPulseLongMs), 80, 1500);
+        autoPulseMediumMs = clampInt(prefs.getInt("auto_pulse_medium_ms", autoPulseMediumMs), 60, 1000);
+        autoPulseShortMs = clampInt(prefs.getInt("auto_pulse_short_ms", autoPulseShortMs), 40, 800);
+        autoSettleMs = clampInt(prefs.getInt("auto_settle_ms", autoSettleMs), 500, 5000);
+        autoMaxStepsSetting = clampInt(prefs.getInt("auto_max_steps", autoMaxStepsSetting), 3, 120);
+        autoToleranceCents = clampDouble(parseStoredDouble(prefs, "auto_tolerance_cents", autoToleranceCents), 0.5, 20.0);
+    }
+
+    private void saveCalibrationSettings() {
+        SharedPreferences.Editor editor = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
+        editor.putInt("auto_speed_percent", autoSpeedPercent);
+        editor.putInt("auto_probe_ms", autoProbeMs);
+        editor.putInt("auto_pulse_long_ms", autoPulseLongMs);
+        editor.putInt("auto_pulse_medium_ms", autoPulseMediumMs);
+        editor.putInt("auto_pulse_short_ms", autoPulseShortMs);
+        editor.putInt("auto_settle_ms", autoSettleMs);
+        editor.putInt("auto_max_steps", autoMaxStepsSetting);
+        editor.putString("auto_tolerance_cents", String.format(Locale.US, "%.3f", autoToleranceCents));
+        editor.apply();
+    }
+
+    private void resetCalibrationDefaults() {
+        autoSpeedPercent = 50;
+        autoProbeMs = 350;
+        autoPulseLongMs = 450;
+        autoPulseMediumMs = 250;
+        autoPulseShortMs = 120;
+        autoSettleMs = 1400;
+        autoMaxStepsSetting = AUTO_MAX_STEPS;
+        autoToleranceCents = AUTO_TOLERANCE_CENTS;
+    }
+
     private double parseStoredDouble(SharedPreferences prefs, String key) {
+        return parseStoredDouble(prefs, key, 0);
+    }
+
+    private double parseStoredDouble(SharedPreferences prefs, String key, double fallback) {
         try {
-            return Double.parseDouble(prefs.getString(key, "0"));
+            return Double.parseDouble(prefs.getString(key, String.valueOf(fallback)));
         } catch (NumberFormatException ex) {
-            return 0;
+            return fallback;
         }
+    }
+
+    private int parseInt(EditText input, int fallback) {
+        try {
+            return Integer.parseInt(input.getText().toString().trim());
+        } catch (NumberFormatException ex) {
+            return fallback;
+        }
+    }
+
+    private double parseDouble(EditText input, double fallback) {
+        try {
+            return Double.parseDouble(input.getText().toString().trim());
+        } catch (NumberFormatException ex) {
+            return fallback;
+        }
+    }
+
+    private int clampInt(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private double clampDouble(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    private String speedCommandForPercent(int percent) {
+        return String.format(Locale.US, "A10801%02X", clampInt(percent, 1, 100));
     }
 
     private int dp(int value) {
@@ -1157,7 +1326,7 @@ public class MainActivity extends Activity {
     private void sourceReady() {
         beginCommandSequence();
         sendCommand("JOG", CMD_MODE_JOG);
-        sendCommand("SPEED50", CMD_SPEED_50);
+        sendCommand("SPEED" + autoSpeedPercent, speedCommandForPercent(autoSpeedPercent));
     }
 
     private void primeThenPulse(String label, String hex) {
@@ -1875,8 +2044,8 @@ public class MainActivity extends Activity {
         autoLowerDirection = Direction.NONE;
         autoText.setText("Auto: probing left direction");
         appendLog("Auto target " + noteName(autoTargetMidi) + " " + autoTargetFrequency);
-        autoPulse(Direction.LEFT, 350);
-        scheduleAuto(this::finishAutoProbe, 1800);
+        autoPulse(Direction.LEFT, autoProbeMs);
+        scheduleAuto(this::finishAutoProbe, autoProbeMs + autoSettleMs);
     }
 
     private void finishAutoProbe() {
@@ -1912,7 +2081,7 @@ public class MainActivity extends Activity {
         if (!autoTuning) {
             return;
         }
-        if (++autoStepCount > AUTO_MAX_STEPS) {
+        if (++autoStepCount > autoMaxStepsSetting) {
             autoText.setText("Auto: stopped, max steps");
             stopAutoTune(true);
             return;
@@ -1924,7 +2093,7 @@ public class MainActivity extends Activity {
         }
 
         double cents = centsBetween(latestStableFrequency, autoTargetFrequency);
-        if (Math.abs(cents) <= AUTO_TOLERANCE_CENTS) {
+        if (Math.abs(cents) <= autoToleranceCents) {
             autoText.setText(String.format(Locale.US, "Auto: done %.1f cents", cents));
             stopAutoTune(true);
             return;
@@ -1937,13 +2106,13 @@ public class MainActivity extends Activity {
             return;
         }
 
-        int duration = Math.abs(cents) > 25 ? 450 : Math.abs(cents) > 10 ? 250 : 120;
+        int duration = Math.abs(cents) > 25 ? autoPulseLongMs : Math.abs(cents) > 10 ? autoPulseMediumMs : autoPulseShortMs;
         autoText.setText(String.format(Locale.US, "Auto: %.1f cents, pulse %s", cents, directionName(direction)));
         if (!autoPulse(direction, duration)) {
             stopAutoTune(true);
             return;
         }
-        scheduleAuto(this::autoAdjustLoop, duration + 1400L);
+        scheduleAuto(this::autoAdjustLoop, duration + autoSettleMs);
     }
 
     private boolean autoPulse(Direction direction, int durationMs) {
