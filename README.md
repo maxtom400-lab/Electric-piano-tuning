@@ -23,6 +23,8 @@ Known BLE board:
 
 See [`PROTOCOL.md`](PROTOCOL.md) for BLE UUIDs, motor commands, stop command, speed commands, and limit switch notifications.
 
+See [`HARDWARE.md`](HARDWARE.md) for the tested board/motor reference links and hardware notes.
+
 ## Tuning Dial
 
 The 12 o'clock zero mark means the selected note is in tune.
