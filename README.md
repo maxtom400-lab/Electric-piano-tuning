@@ -1,72 +1,68 @@
+# MAX Piano Tuner
 
-```text
-# BLE Motor Control Protocol
+Android app for piano tuning assistance with BLE motor control.
 
-Device name: `JUXUN-88888888`
+The app combines:
 
-Known device address: `DE:AB:BD:EA:2F:DE`
+- microphone pitch detection
+- a piano-style tuning dial
+- 88-key recording workflow
+- BLE control for a 12V geared motor board
+- left/right limit switch handling
+- safe hold-to-run motor controls
 
-## BLE Characteristics
+## Hardware
 
-Write characteristic:
+Known BLE board:
 
-`0000ffe2-0000-1000-8000-00805f9b34fb`
+- Device name: `JUXUN-88888888`
+- Known address: `DE:AB:BD:EA:2F:DE`
+- Motor: 12V geared motor, about 90 RPM
+- Limit switches: left and right limit inputs
 
-Notify characteristic:
+See [`PROTOCOL.md`](PROTOCOL.md) for BLE UUIDs, motor commands, stop command, speed commands, and limit switch notifications.
 
-`0000ffe1-0000-1000-8000-00805f9b34fb`
+## Tuning Dial
 
-CCCD descriptor:
+The 12 o'clock zero mark means the selected note is in tune.
 
-`00002902-0000-1000-8000-00805f9b34fb`
+If the detected pitch is outside the supported tuning span, the app moves the dial to the limit and triggers a red edge alarm plus vibration.
 
-## Startup Sequence
+## 88-Key Recording
 
-After connecting and enabling notifications, send:
+Open the top-left menu and tap `Record 88 Keys`.
 
-| Action | Hex |
-| --- | --- |
-| Init | `AF010203040506FF` |
-| Jog mode | `A10302011F` |
-| Speed 50 | `A1080132` |
+The workflow records all keys from `A0` to `C8`. Each key requires 3 stable pitch samples; the app saves the median value and then advances automatically.
 
-## Motor Commands
+After all 88 keys are recorded, tap `Compute Tuning` to enable a lightweight stretch tuning map. The current implementation is intentionally simple and can later be replaced with full spectral/inharmonicity analysis similar to Entropy Piano Tuner.
 
-| Action | Hex |
-| --- | --- |
-| Left / reverse hold | `A1010100000003321F` |
-| Right / forward hold | `A1020100000003321F` |
-| Stop | `A10102000000031F` |
+See [`RECORDING_WORKFLOW.md`](RECORDING_WORKFLOW.md).
 
-The app uses hold buttons: press sends left/right, release sends stop.
+## BLE Heartbeat
 
-## Speed Commands
+After a successful BLE connection and initialization, the app sends a safe heartbeat packet every 10 minutes:
 
-| Speed | Hex |
-| --- | --- |
-| 30 | `A108011E` |
-| 50 | `A1080132` |
+`AF010203040506FF`
 
-## Mode Commands
+This is the same init/keepalive-style packet and does not command motor motion. The heartbeat stops automatically when BLE disconnects.
 
-| Mode | Hex |
-| --- | --- |
-| Jog mode | `A10302011F` |
-| Lock / continuous mode | `A10303011F` |
+## Build
 
-## Limit Switch Notifications
+Open this folder in Android Studio and run the `app` debug build.
 
-Notifications arrive from characteristic `FFE1`.
+Minimum Android SDK: 23
 
-| Event | Hex |
-| --- | --- |
-| Left limit pressed | `A10101` |
-| Left limit released | `A10102` |
-| Right limit pressed | `A10201` |
-| Right limit released | `A10202` |
+Target Android SDK: 35
 
-When a limit is pressed, motor motion in the current direction should stop and that direction should be blocked until the motor reverses.
+Required permissions:
 
+- Bluetooth scan/connect
+- Location on older Android versions
+- Microphone
+- Vibration
 
-```
+## Disclaimer
 
+This software controls a motor attached to piano tuning hardware. Use carefully. Incorrect operation can break piano strings or damage hardware. You are responsible for safe testing and mechanical limits.
+
+TORY HIGH SCHOOL MAX.YING 2026.
