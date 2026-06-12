@@ -2627,6 +2627,8 @@ public class MainActivity extends Activity {
         private final Runnable menuListener;
         private static final float BLACK_TOP = 0f;
         private static final float BLACK_BOTTOM = 178f;
+        private static final float MIDDLE_DIAL_RADIUS_RATIO = 318f / 390f;
+        private static final float INNER_DIAL_RADIUS_RATIO = 269f / 390f;
         private static final float[] BLACK_LEFT = {
                 56f, 169f, 237f, 343f, 421f, 487f, 604f, 672f, 778f, 856f, 914f, 1037f,
                 1106f, 1220f, 1290f, 1356f, 1468f, 1529f, 1652f, 1713f, 1787f, 1902f,
@@ -2752,8 +2754,8 @@ public class MainActivity extends Activity {
             if (skinBitmap != null) {
                 drawSkinnedTuner(canvas, w, h);
                 drawRangeAlarm(canvas, w, h);
-                if (isShown()) {
-                    postInvalidateDelayed(33);
+                if (getWindowVisibility() == VISIBLE) {
+                    postInvalidateOnAnimation();
                 }
                 return;
             }
@@ -2765,8 +2767,8 @@ public class MainActivity extends Activity {
             drawDial(canvas, cx, cy, r);
             drawOctaveKeyboard(canvas, dpLocal(18), dpLocal(500), w - dpLocal(36), dpLocal(332));
             drawRangeAlarm(canvas, w, h);
-            if (isShown()) {
-                postInvalidateDelayed(33);
+            if (getWindowVisibility() == VISIBLE) {
+                postInvalidateOnAnimation();
             }
         }
 
@@ -2803,17 +2805,10 @@ public class MainActivity extends Activity {
             float layerCy = cy + dpLocal(7);
             float pitchRotation = -displayCents * TUNER_DIAL_DEGREES_PER_CENT;
             drawRotatingBitmap(canvas, rotatingDialBitmap, cx, layerCy, radius, pitchRotation);
-            drawRotatingBitmap(canvas, rotatingMiddleBitmap, cx, layerCy,
-                    scaledLayerRadius(radius, rotatingMiddleBitmap), -pitchRotation - gearRotationDegrees * 0.155f);
-            drawRotatingBitmap(canvas, rotatingInnerBitmap, cx, layerCy,
-                    scaledLayerRadius(radius, rotatingInnerBitmap), pitchRotation + gearRotationDegrees * 0.29f);
-        }
-
-        private float scaledLayerRadius(float outerRadius, Bitmap layer) {
-            if (layer == null || rotatingDialBitmap == null || rotatingDialBitmap.getWidth() == 0) {
-                return outerRadius;
-            }
-            return outerRadius * layer.getWidth() / (float) rotatingDialBitmap.getWidth();
+            drawRotatingBitmap(canvas, rotatingMiddleBitmap, cx, layerCy, radius * MIDDLE_DIAL_RADIUS_RATIO,
+                    -pitchRotation - gearRotationDegrees * 0.155f);
+            drawRotatingBitmap(canvas, rotatingInnerBitmap, cx, layerCy, radius * INNER_DIAL_RADIUS_RATIO,
+                    pitchRotation + gearRotationDegrees * 0.29f);
         }
 
         private void drawRotatingBitmap(Canvas canvas, Bitmap bitmap, float cx, float cy, float radius, float degrees) {
