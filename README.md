@@ -72,6 +72,10 @@ This is the same init/keepalive-style packet and does not command motor motion. 
 
 Open this folder in Android Studio and run the `app` debug build.
 
+## Project Document
+
+- [PIANO.docx](docs/PIANO.docx)
+
 Minimum Android SDK: 23
 
 Target Android SDK: 35
