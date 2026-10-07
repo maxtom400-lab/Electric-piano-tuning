@@ -1,5 +1,28 @@
 # BLE Motor Control Protocol
 
+## Current ESP32-C3 Controller
+
+The current app scans for `troy high school`. It does not use the legacy fixed MAC address.
+
+| Action | Hex |
+| --- | --- |
+| Left / low-note continuous motion, speed 50 | `A1010100000002321F` |
+| Right / high-note continuous motion, speed 50 | `A1020100000002321F` |
+| Stop | `A10102000000011F` |
+| ESP32-local homing | `A1F001` |
+| Set speed 50 | `A1080132` |
+| Ready / heartbeat request | `AF010203040506FF` |
+
+Service UUID: `0000ffe0-0000-1000-8000-00805f9b34fb`. The write and notify UUIDs below are shared with the current controller.
+
+ESP32 reads the two limit inputs locally, stops motion toward an active limit, and reports the four binary limit events listed below. Homing sends ASCII notifications: `HOME_START`, `HOME_LOW_LIMIT`, `HOME_BACKOFF`, `HOME_DONE`, `HOME_ABORT`, and `FAULT`.
+
+See [firmware documentation](firmware/esp32_c3_piano_motor/README.md) for the current wiring, protection logic and text commands. Homing backoff is timed at 10 seconds by default; 10 revolutions is an estimate pending hardware calibration.
+
+## Legacy Board Reference
+
+The remaining sections preserve earlier vendor-board observations. Its startup/mode commands and original motion bytes are historical references, not the current ESP32 initialization procedure. Reliable limit feedback was not confirmed on the vendor board.
+
 Device name: `JUXUN-88888888`
 
 Known device address: `DE:AB:BD:EA:2F:DE`

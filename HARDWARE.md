@@ -1,5 +1,13 @@
 # Hardware Reference
 
+## Current ESP32-C3 Prototype
+
+The current app and firmware target an ESP32-C3 SuperMini named `troy high school`, a separate 12V DC motor driver, and two limit switches connected directly to GPIO6/GPIO7. GPIO4/GPIO5 control the driver's IN1/IN2. A 12V-to-5V buck converter powers the ESP32; all grounds are common.
+
+This new hardware combination awaits bench testing. The current timing model assumes 60 RPM, not the older 90 RPM value below. See [firmware wiring and test instructions](firmware/esp32_c3_piano_motor/README.md).
+
+## Earlier Vendor-Board Setup
+
 This project was developed and tested with a small BLE DC motor controller board and a 12V geared brushed DC motor.
 
 ## Purchase Reference Links
