@@ -16,6 +16,7 @@ import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -42,6 +43,7 @@ import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -61,8 +63,9 @@ import java.util.Locale;
 import java.util.UUID;
 
 public class MainActivity extends Activity {
+    private static final String TAG = "PianoTuner";
     private static final int REQUEST_PERMISSIONS = 1001;
-    private static final long SCAN_MS = 10_000L;
+    private static final long SCAN_MS = 20_000L;
     private static final long HEARTBEAT_MS = 10 * 60 * 1000L;
     private static final int PIANO_SCAN_SAMPLES_REQUIRED = 3;
     private static final int SAMPLE_RATE = 44100;
@@ -76,6 +79,35 @@ public class MainActivity extends Activity {
     private static final double AUTO_TOLERANCE_CENTS = 3.0;
     private static final int AUTO_MAX_STEPS = 40;
     private static final int AUTO_NOTE_WINDOW_SEMITONES = 2;
+    private static final double EXPERIENCE_MOTOR_RPM = 60.0;
+    private static final double EXPERIENCE_REV_MS = 60000.0 / EXPERIENCE_MOTOR_RPM;
+    private static final double EXPERIENCE_PIN_DEGREES_PER_REV = 0.28;
+    private static final double MOTOR_TOTAL_TRAVEL_REV = 40.0;
+    private static final double MOTOR_INIT_BACKOFF_REV = 10.0;
+    private static final long MOTOR_INIT_SEEK_TIMEOUT_MS = 120_000L;
+    private static final long MOTOR_INIT_LIMIT_DEBOUNCE_MS = 1_000L;
+    private static final double EXPERIENCE_LOW_CENTS_PER_REV = 2.8;
+    private static final double EXPERIENCE_MID_CENTS_PER_REV = 4.5;
+    private static final double EXPERIENCE_HIGH_CENTS_PER_REV = 12.6;
+    private static final int EXPERIENCE_LOW_MIDI = 21;
+    private static final int EXPERIENCE_MID_MIDI = 60;
+    private static final int EXPERIENCE_HIGH_MIDI = 108;
+    private static final int[] EXPERIENCE_CURVE_MIDI = {
+            EXPERIENCE_LOW_MIDI,
+            EXPERIENCE_MID_MIDI,
+            EXPERIENCE_HIGH_MIDI
+    };
+    private static final double[] EXPERIENCE_CURVE_CENTS_PER_REV = {
+            EXPERIENCE_LOW_CENTS_PER_REV,
+            EXPERIENCE_MID_CENTS_PER_REV,
+            EXPERIENCE_HIGH_CENTS_PER_REV
+    };
+    private static final int EXPERIENCE_MIN_PULSE_MS = 60;
+    private static final int EXPERIENCE_DEFAULT_MAX_PULSE_MS = 12000;
+    private static final double DEFAULT_PRELOAD_LOW_REV = 6.0;
+    private static final long EXPERIENCE_RESTRIKE_ARM_MS = 450L;
+    private static final int WRONG_KEY_ALLOWED_SEMITONES = 2;
+    private static final long SAFETY_VIBRATION_COOLDOWN_MS = 900L;
 
     private enum Direction {
         NONE,
@@ -83,8 +115,7 @@ public class MainActivity extends Activity {
         RIGHT
     }
 
-    private static final String TARGET_NAME = "JUXUN-88888888";
-    private static final String TARGET_ADDRESS = "DE:AB:BD:EA:2F:DE";
+    private static final String TARGET_NAME = "troy high school";
 
     private static final UUID WRITE_UUID =
             UUID.fromString("0000ffe2-0000-1000-8000-00805f9b34fb");
@@ -94,13 +125,12 @@ public class MainActivity extends Activity {
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     private static final String CMD_INIT = "AF010203040506FF";
-    private static final String CMD_LEFT = "A1010100000003321F";
-    private static final String CMD_STOP = "A10102000000031F";
-    private static final String CMD_RIGHT = "A1020100000003321F";
+    private static final String CMD_LEFT = "A1010100000002321F";
+    private static final String CMD_STOP = "A10102000000011F";
+    private static final String CMD_RIGHT = "A1020100000002321F";
+    private static final String CMD_HOME = "A1F001";
     private static final String CMD_SPEED_50 = "A1080132";
     private static final String CMD_SPEED_30 = "A108011E";
-    private static final String CMD_MODE_JOG = "A10302011F";
-    private static final String CMD_MODE_LOCK = "A10303011F";
     private static final String CMD_SPEED_STEP = CMD_SPEED_50;
     private static final String PREFS_NAME = "max_piano_tuner";
 
@@ -150,6 +180,8 @@ public class MainActivity extends Activity {
     private boolean replayVendorLrAfterInitAck;
     private Direction currentDirection = Direction.NONE;
     private Direction blockedDirection = Direction.NONE;
+    private Direction motorSafetyBackoffOriginLimit = Direction.NONE;
+    private long motorSafetySeekStartedAtMs;
     private AudioRecord audioRecord;
     private Thread audioThread;
     private volatile boolean listening;
@@ -183,6 +215,22 @@ public class MainActivity extends Activity {
     private int autoSettleMs = 1400;
     private int autoMaxStepsSetting = AUTO_MAX_STEPS;
     private double autoToleranceCents = AUTO_TOLERANCE_CENTS;
+    private int autoExperienceMaxPulseMs = EXPERIENCE_DEFAULT_MAX_PULSE_MS;
+    private double autoPreloadLowRev = DEFAULT_PRELOAD_LOW_REV;
+    private boolean autoWaitingForRestrike;
+    private long autoIgnorePitchBeforeMs;
+    private double autoLastObservedCents;
+    private double autoLastExpectedDeltaCents;
+    private int autoLastDurationMs;
+    private Direction autoLastDirection = Direction.NONE;
+    private final double[] autoExperienceScale = new double[109];
+    private boolean motorSafetyInitInProgress;
+    private boolean motorSafetyBackoffInProgress;
+    private boolean motorSafetyInitialized;
+    private int motorSafetyInitializedMidi;
+    private double motorPositionRevFromLow = Double.NaN;
+    private boolean autoArmedForPianoStrike;
+    private long lastSafetyVibrateMs;
     private boolean keyPreviewEnabled;
     private long lastRangeAlarmVibrateMs;
     private AlertDialog pianoScanDialog;
@@ -211,21 +259,31 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            String name = device.getName();
-            boolean addressMatch = TARGET_ADDRESS.equalsIgnoreCase(device.getAddress());
-            boolean nameMatch = name != null && TARGET_NAME.equalsIgnoreCase(name);
-            if (!addressMatch && !nameMatch) {
+            String name = safeDeviceName(device);
+            String advertisedName = result.getScanRecord() == null ? null : result.getScanRecord().getDeviceName();
+            String bestName = firstNonEmpty(advertisedName, name);
+            boolean nameMatch = isTargetMotorName(name) || isTargetMotorName(advertisedName);
+            if (bestName != null && (nameMatch || bestName.length() > 0)) {
+                appendLogSafe(String.format(Locale.US,
+                        "BLE scan %s name=%s adv=%s rssi=%d match=%s",
+                        device.getAddress(),
+                        valueOrDash(name),
+                        valueOrDash(advertisedName),
+                        result.getRssi(),
+                        nameMatch));
+            }
+            if (!nameMatch) {
                 return;
             }
 
             targetDevice = device;
             runOnUiThread(() -> {
-                setStatus("Found motor");
-                appendLog("Found target " + deviceLabel(device));
+                setStatus("已找到蓝牙电机板");
+                appendLog("找到目标设备 " + deviceLabel(device));
                 if (connectAfterScan) {
                     connectAfterScan = false;
                     stopScan();
-                    showMotorDialog("Connecting to motor...");
+                    showMotorDialog("正在连接蓝牙电机板...");
                     connectTarget();
                 }
             });
@@ -237,7 +295,7 @@ public class MainActivity extends Activity {
                 scanning = false;
                 connectAfterScan = false;
                 dismissMotorDialog();
-                setStatus("Scan failed: " + errorCode);
+                setStatus("蓝牙扫描失败: " + errorCode);
             });
         }
     };
@@ -247,9 +305,9 @@ public class MainActivity extends Activity {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                appendLogSafe("GATT connected, discovering services");
-                runOnUiThread(() -> showMotorDialog("Discovering motor service..."));
-                runOnUiThread(() -> setStatus("Connected, discovering services"));
+                appendLogSafe("蓝牙已连接，正在发现服务");
+                runOnUiThread(() -> showMotorDialog("正在发现电机服务..."));
+                runOnUiThread(() -> setStatus("蓝牙已连接，正在发现服务"));
                 gatt.discoverServices();
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (MainActivity.this.gatt == gatt) {
@@ -257,13 +315,13 @@ public class MainActivity extends Activity {
                     writeCharacteristic = null;
                 }
                 gatt.close();
-                appendLogSafe("GATT disconnected, status=" + status);
+                appendLogSafe("蓝牙已断开，status=" + status);
                 runOnUiThread(() -> stopHeartbeat());
                 runOnUiThread(() -> dismissMotorDialog());
-                runOnUiThread(() -> setStatus("Disconnected"));
+                runOnUiThread(() -> setStatus("蓝牙已断开"));
                 if (reconnectAfterDisconnect) {
                     reconnectAfterDisconnect = false;
-                    handler.postDelayed(() -> openGattConnection("Reconnecting "), 650L);
+                    handler.postDelayed(() -> openGattConnection("正在重新连接 "), 650L);
                 }
             }
         }
@@ -288,16 +346,16 @@ public class MainActivity extends Activity {
             runOnUiThread(() -> {
                 if (writeCharacteristic == null) {
                     dismissMotorDialog();
-                    setStatus("Connected, but FFE2 write characteristic not found");
+                    setStatus("已连接，但未找到 FFE2 写入通道");
                 } else {
-                    setStatus("Ready: FFE2 write selected");
+                    setStatus("蓝牙就绪：已选择 FFE2 写入通道");
                 }
             });
 
             if (notifyCharacteristic != null) {
                 enableNotifications(gatt, notifyCharacteristic);
             } else {
-                appendLogSafe("FFE1 notify characteristic not found");
+                appendLogSafe("未找到 FFE1 通知通道");
             }
         }
 
@@ -306,11 +364,10 @@ public class MainActivity extends Activity {
             appendLogSafe("CCCD write status=" + status);
             if (status == BluetoothGatt.GATT_SUCCESS && CCCD_UUID.equals(descriptor.getUuid())) {
                 sendCommandFromGattCallback("INIT", CMD_INIT);
-                scheduleCommand("AUTO JOG", CMD_MODE_JOG, 180L);
-                scheduleCommand("AUTO SPEED" + autoSpeedPercent, speedCommandForPercent(autoSpeedPercent), 360L);
+                scheduleCommand("AUTO SPEED" + autoSpeedPercent, speedCommandForPercent(autoSpeedPercent), 180L);
                 runOnUiThread(() -> startHeartbeat());
                 runOnUiThread(() -> dismissMotorDialog());
-                runOnUiThread(() -> setStatus("Connected: auto ready sent"));
+                runOnUiThread(() -> setStatus("蓝牙已连接：电机初始化命令已发送"));
                 if (pendingFreshHex != null) {
                     String label = pendingFreshLabel;
                     String hex = pendingFreshHex;
@@ -362,19 +419,18 @@ public class MainActivity extends Activity {
                 BluetoothGatt gatt,
                 BluetoothGattCharacteristic characteristic
         ) {
-            byte[] value = characteristic.getValue();
-            String hex = toHex(value);
-            if (isInitAck(value) && replayVendorLrAfterInitAck) {
-                replayVendorLrAfterInitAck = false;
-                pendingReplayVendorLr = false;
-                scheduleVendorLrReplay(5675L);
-            }
-            handleLimitNotification(value);
-            runOnUiThread(() -> {
-                notifyText.setText("Notify: " + hex);
-                appendLog("Notify " + characteristic.getUuid() + " = " + hex);
-            });
+            handleNotifyValue(characteristic, characteristic.getValue());
         }
+
+        @Override
+        public void onCharacteristicChanged(
+                BluetoothGatt gatt,
+                BluetoothGattCharacteristic characteristic,
+                byte[] value
+        ) {
+            handleNotifyValue(characteristic, value);
+        }
+
     };
 
     @Override
@@ -424,7 +480,7 @@ public class MainActivity extends Activity {
         notifyText = text("", 1, Color.TRANSPARENT, false);
         logText = text("", 1, Color.TRANSPARENT, false);
 
-        tunerView = new SteampunkTunerView(this, this::selectTargetMidi, this::showControlPopup);
+        tunerView = new SteampunkTunerView(this, this::handleVirtualPianoKeySelected, this::showControlPopup);
         root.addView(tunerView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(860)
@@ -540,7 +596,7 @@ public class MainActivity extends Activity {
         panel.setPadding(dp(22), dp(18), dp(22), dp(18));
         panel.setBackgroundColor(Color.rgb(232, 198, 139));
 
-        Button connect = popupButton("Connect Board");
+        Button connect = popupButton("连接蓝牙电机板");
         connect.setOnClickListener(v -> connectOnce());
         panel.addView(connect);
 
@@ -632,8 +688,9 @@ public class MainActivity extends Activity {
                         + "1. The piano rib bracket is locked and cannot slide.\n"
                         + "2. Left and right limit switches have been tested.\n"
                         + "3. Manual HOLD LEFT and HOLD RIGHT work correctly.\n"
-                        + "4. The selected key is " + note + ". Play this key until the pitch display is stable.\n\n"
-                        + "Auto mode sends short motor pulses. Stop immediately if the mechanism moves unexpectedly.")
+                        + "4. The selected key is " + note + ". Play this key until the pitch display is stable.\n"
+                        + "5. Experience mode assumes LEFT lowers pitch and RIGHT raises pitch.\n\n"
+                        + "The app will calculate one motor move from the learned cents/rotation map, then wait for the next physical key strike to refine the next move. Stop immediately if the mechanism moves unexpectedly.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Start Auto Tune", (dialog, which) -> startAutoTune())
                 .show();
@@ -653,6 +710,8 @@ public class MainActivity extends Activity {
         EditText settle = numberEditText(autoSettleMs);
         EditText maxSteps = numberEditText(autoMaxStepsSetting);
         EditText tolerance = decimalEditText(autoToleranceCents);
+        EditText experienceMaxPulse = numberEditText(autoExperienceMaxPulseMs);
+        EditText preloadLow = decimalEditText(autoPreloadLowRev);
 
         panel.addView(label("Speed percent (1-100)"));
         panel.addView(speed);
@@ -670,6 +729,10 @@ public class MainActivity extends Activity {
         panel.addView(maxSteps);
         panel.addView(label("Done tolerance cents"));
         panel.addView(tolerance);
+        panel.addView(label("Experience one-shot max ms"));
+        panel.addView(experienceMaxPulse);
+        panel.addView(label("Preload low-direction revs"));
+        panel.addView(preloadLow);
 
         new AlertDialog.Builder(this)
                 .setTitle("Calibration")
@@ -689,6 +752,8 @@ public class MainActivity extends Activity {
                     autoSettleMs = clampInt(parseInt(settle, autoSettleMs), 500, 5000);
                     autoMaxStepsSetting = clampInt(parseInt(maxSteps, autoMaxStepsSetting), 3, 120);
                     autoToleranceCents = clampDouble(parseDouble(tolerance, autoToleranceCents), 0.5, 20.0);
+                    autoExperienceMaxPulseMs = clampInt(parseInt(experienceMaxPulse, autoExperienceMaxPulseMs), 500, 60000);
+                    autoPreloadLowRev = clampDouble(parseDouble(preloadLow, autoPreloadLowRev), 0.0, 10.0);
                     saveCalibrationSettings();
                     toast("Calibration saved");
                 })
@@ -989,6 +1054,11 @@ public class MainActivity extends Activity {
         autoSettleMs = clampInt(prefs.getInt("auto_settle_ms", autoSettleMs), 500, 5000);
         autoMaxStepsSetting = clampInt(prefs.getInt("auto_max_steps", autoMaxStepsSetting), 3, 120);
         autoToleranceCents = clampDouble(parseStoredDouble(prefs, "auto_tolerance_cents", autoToleranceCents), 0.5, 20.0);
+        autoExperienceMaxPulseMs = clampInt(prefs.getInt("auto_experience_max_pulse_ms", autoExperienceMaxPulseMs), 500, 60000);
+        autoPreloadLowRev = clampDouble(parseStoredDouble(prefs, "auto_preload_low_rev", autoPreloadLowRev), 0.0, 10.0);
+        for (int midi = 21; midi <= 108; midi++) {
+            autoExperienceScale[midi] = clampDouble(parseStoredDouble(prefs, "auto_exp_scale_" + midi, 1.0), 0.25, 4.0);
+        }
     }
 
     private void saveCalibrationSettings() {
@@ -1001,6 +1071,11 @@ public class MainActivity extends Activity {
         editor.putInt("auto_settle_ms", autoSettleMs);
         editor.putInt("auto_max_steps", autoMaxStepsSetting);
         editor.putString("auto_tolerance_cents", String.format(Locale.US, "%.3f", autoToleranceCents));
+        editor.putInt("auto_experience_max_pulse_ms", autoExperienceMaxPulseMs);
+        editor.putString("auto_preload_low_rev", String.format(Locale.US, "%.3f", autoPreloadLowRev));
+        for (int midi = 21; midi <= 108; midi++) {
+            editor.putString("auto_exp_scale_" + midi, String.format(Locale.US, "%.6f", experienceScaleForMidi(midi)));
+        }
         editor.apply();
     }
 
@@ -1013,6 +1088,11 @@ public class MainActivity extends Activity {
         autoSettleMs = 1400;
         autoMaxStepsSetting = AUTO_MAX_STEPS;
         autoToleranceCents = AUTO_TOLERANCE_CENTS;
+        autoExperienceMaxPulseMs = EXPERIENCE_DEFAULT_MAX_PULSE_MS;
+        autoPreloadLowRev = DEFAULT_PRELOAD_LOW_REV;
+        for (int midi = 21; midi <= 108; midi++) {
+            autoExperienceScale[midi] = 1.0;
+        }
     }
 
     private double parseStoredDouble(SharedPreferences prefs, String key) {
@@ -1069,7 +1149,7 @@ public class MainActivity extends Activity {
         }
         if (motorDialog == null) {
             motorDialog = new AlertDialog.Builder(this)
-                    .setTitle("Motor Connection")
+                    .setTitle("蓝牙电机板连接")
                     .setMessage(message)
                     .setNegativeButton("Cancel", (dialog, which) -> {
                         connectAfterScan = false;
@@ -1109,7 +1189,70 @@ public class MainActivity extends Activity {
 
     private void appendLog(String value) {
         String line = String.format(Locale.US, "%tT  %s\n", System.currentTimeMillis(), value);
+        Log.d(TAG, value);
         logText.append(line);
+    }
+
+    private void handleNotifyValue(BluetoothGattCharacteristic characteristic, byte[] value) {
+        String hex = toHex(value);
+        handleEsp32StatusNotification(value);
+        if (isInitAck(value) && replayVendorLrAfterInitAck) {
+            replayVendorLrAfterInitAck = false;
+            pendingReplayVendorLr = false;
+            scheduleVendorLrReplay(5675L);
+        }
+        handleLimitNotification(value);
+        runOnUiThread(() -> {
+            notifyText.setText("Notify: " + hex);
+            appendLog("Notify " + characteristic.getUuid() + " = " + hex);
+        });
+    }
+
+    private void handleEsp32StatusNotification(byte[] value) {
+        String text = printableAscii(value);
+        if (text == null) {
+            return;
+        }
+        String clean = text.trim().toUpperCase(Locale.US);
+        if (clean.length() == 0) {
+            return;
+        }
+        if ("HOME_START".equals(clean)) {
+            runOnUiThread(() -> {
+                setStatus("ESP32: 初始化开始，正在寻找低音侧限位");
+                if (autoText != null) {
+                    autoText.setText("Init: ESP32 seeking low limit");
+                }
+            });
+        } else if ("HOME_LOW_LIMIT".equals(clean)) {
+            runOnUiThread(() -> {
+                setStatus("ESP32: 已碰到低音侧限位，准备回退");
+                if (autoText != null) {
+                    autoText.setText("Init: low limit found, backing off");
+                }
+            });
+        } else if ("HOME_BACKOFF".equals(clean)) {
+            runOnUiThread(() -> {
+                setStatus("ESP32: 正在反向回退 10 圈");
+                if (autoText != null) {
+                    autoText.setText("Init: backing off 10 rev");
+                }
+            });
+        } else if ("HOME_DONE".equals(clean)) {
+            runOnUiThread(this::finishMotorSafetyInitializationFromEsp32);
+        } else if (clean.startsWith("HOME_ABORT")
+                || clean.startsWith("FAULT")
+                || clean.startsWith("ERR")) {
+            motorSafetyInitInProgress = false;
+            motorSafetyBackoffInProgress = false;
+            triggerSafetyVibration("ESP32 motor fault");
+            runOnUiThread(() -> {
+                setStatus("ESP32: 初始化失败/电机保护触发");
+                if (autoText != null) {
+                    autoText.setText("Init: ESP32 fault - " + clean);
+                }
+            });
+        }
     }
 
     private int readRepeat() {
@@ -1123,7 +1266,7 @@ public class MainActivity extends Activity {
     @SuppressLint("MissingPermission")
     private void startScan() {
         if (adapter == null || scanner == null) {
-            toast("BLE not available");
+            toast("手机不支持 BLE 蓝牙");
             return;
         }
         if (!hasScanPermission()) {
@@ -1134,9 +1277,13 @@ public class MainActivity extends Activity {
         stopScan();
         targetDevice = null;
         scanning = true;
-        setStatus("Searching motor");
-        appendLog("Scan started");
-        scanner.startScan(scanCallback);
+        setStatus("正在搜索蓝牙电机板");
+        appendLog("开始高强度 BLE 扫描");
+        ScanSettings settings = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setReportDelay(0L)
+                .build();
+        scanner.startScan(null, settings, scanCallback);
         handler.postDelayed(this::stopScan, SCAN_MS);
     }
 
@@ -1145,14 +1292,14 @@ public class MainActivity extends Activity {
         if (scanner != null && scanning && hasScanPermission()) {
             scanner.stopScan(scanCallback);
             scanning = false;
-            appendLog("Scan stopped");
+            appendLog("扫描已停止");
             if (targetDevice == null) {
                 if (connectAfterScan) {
                     connectAfterScan = false;
                     dismissMotorDialog();
-                    toast("Motor not found");
+                    toast("未找到蓝牙电机板");
                 }
-                setStatus("Motor not found");
+                setStatus("未找到蓝牙电机板");
             }
         }
     }
@@ -1164,11 +1311,8 @@ public class MainActivity extends Activity {
             return;
         }
         if (targetDevice == null) {
-            if (adapter == null) {
-                toast("Scan first");
-                return;
-            }
-            targetDevice = adapter.getRemoteDevice(TARGET_ADDRESS);
+            toast("请先扫描到 " + TARGET_NAME);
+            return;
         }
 
         if (gatt != null) {
@@ -1176,15 +1320,15 @@ public class MainActivity extends Activity {
             requestGattDisconnect();
             return;
         }
-        openGattConnection("Connecting ");
+        openGattConnection("正在连接 ");
     }
 
     private void connectOnce() {
         if (gatt != null) {
-            appendLog("Already connected or connecting");
+            appendLog("蓝牙已连接或正在连接");
             return;
         }
-        showMotorDialog("Searching for motor...");
+        showMotorDialog("正在搜索蓝牙电机板...");
         if (targetDevice == null) {
             stopScan();
             connectAfterScan = true;
@@ -1201,10 +1345,10 @@ public class MainActivity extends Activity {
             return;
         }
         if (targetDevice == null) {
-            toast("Scan first");
+            toast("请先扫描蓝牙电机板");
             return;
         }
-        setStatus(prefix + "motor");
+        setStatus(prefix + "蓝牙电机板");
         appendLog(prefix + deviceLabel(targetDevice));
         gatt = targetDevice.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
     }
@@ -1231,7 +1375,7 @@ public class MainActivity extends Activity {
                     writeCharacteristic = null;
                     if (reconnectAfterDisconnect) {
                         reconnectAfterDisconnect = false;
-                        openGattConnection("Reconnecting ");
+                        openGattConnection("正在重新连接 ");
                     }
                 }
             }, 1500L);
@@ -1251,8 +1395,13 @@ public class MainActivity extends Activity {
 
         BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CCCD_UUID);
         if (descriptor != null) {
-            descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-            boolean started = gatt.writeDescriptor(descriptor);
+            boolean started;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                started = gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothGatt.GATT_SUCCESS;
+            } else {
+                descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                started = gatt.writeDescriptor(descriptor);
+            }
             appendLogSafe("CCCD write started=" + started);
         }
     }
@@ -1263,7 +1412,6 @@ public class MainActivity extends Activity {
             return;
         }
         sendCommand(label, hex);
-        scheduleCommand(label + " repeat", hex, 130);
     }
 
     private void startHoldMotion(String label, String hex) {
@@ -1271,15 +1419,8 @@ public class MainActivity extends Activity {
         if (!prepareMotion(label, hex)) {
             return;
         }
-        sendCommand(label, hex);
-        activeMotionRunnable = new Runnable() {
-            @Override
-            public void run() {
-                sendCommand(label + " hold", hex);
-                handler.postDelayed(this, 130);
-            }
-        };
-        handler.postDelayed(activeMotionRunnable, 130);
+        int generation = commandGeneration;
+        startContinuousCommand(label, hex, () -> generation == commandGeneration, generation);
     }
 
     private void stopHoldMotion(String label) {
@@ -1293,19 +1434,8 @@ public class MainActivity extends Activity {
         if (!prepareMotion(label, hex)) {
             return;
         }
-        sendCommand(label, hex);
         int generation = commandGeneration;
-        activeMotionRunnable = new Runnable() {
-            @Override
-            public void run() {
-                if (generation != commandGeneration) {
-                    return;
-                }
-                sendCommand(label + " pulse", hex);
-                handler.postDelayed(this, 130);
-            }
-        };
-        handler.postDelayed(activeMotionRunnable, 130);
+        startContinuousCommand(label, hex, () -> generation == commandGeneration, generation);
         handler.postDelayed(() -> {
             if (generation == commandGeneration) {
                 cancelScheduledCommands();
@@ -1325,7 +1455,11 @@ public class MainActivity extends Activity {
 
     private void sourceReady() {
         beginCommandSequence();
-        sendCommand("JOG", CMD_MODE_JOG);
+        sendCommand("SPEED" + autoSpeedPercent, speedCommandForPercent(autoSpeedPercent));
+    }
+
+    private void continuousMotionReady() {
+        beginCommandSequence();
         sendCommand("SPEED" + autoSpeedPercent, speedCommandForPercent(autoSpeedPercent));
     }
 
@@ -1431,9 +1565,6 @@ public class MainActivity extends Activity {
 
     private void freshReplayVendorLr() {
         beginCommandSequence();
-        if (targetDevice == null && adapter != null) {
-            targetDevice = adapter.getRemoteDevice(TARGET_ADDRESS);
-        }
         if (targetDevice == null) {
             toast("Scan first");
             return;
@@ -1444,7 +1575,7 @@ public class MainActivity extends Activity {
             reconnectAfterDisconnect = true;
             requestGattDisconnect();
         } else {
-            scheduleRunnable(() -> openGattConnection("Connecting "), 650L);
+            scheduleRunnable(() -> openGattConnection("正在连接 "), 650L);
         }
     }
 
@@ -1469,9 +1600,6 @@ public class MainActivity extends Activity {
             long stopExtraMs
     ) {
         beginCommandSequence();
-        if (targetDevice == null && adapter != null) {
-            targetDevice = adapter.getRemoteDevice(TARGET_ADDRESS);
-        }
         if (targetDevice == null) {
             toast("Scan first");
             return;
@@ -1490,7 +1618,7 @@ public class MainActivity extends Activity {
             reconnectAfterDisconnect = true;
             requestGattDisconnect();
         } else {
-            scheduleRunnable(() -> openGattConnection("Connecting "), 650L);
+            scheduleRunnable(() -> openGattConnection("正在连接 "), 650L);
         }
     }
 
@@ -1499,7 +1627,8 @@ public class MainActivity extends Activity {
         if (direction == Direction.NONE) {
             return true;
         }
-        if (blockedDirection == direction) {
+        if (blockedDirection == direction
+                && !(motorSafetyBackoffInProgress && blockedDirection == motorSafetyBackoffOriginLimit)) {
             String message = directionName(direction) + " limit is active; use opposite direction";
             appendLog(message);
             setStatus(message);
@@ -1526,6 +1655,15 @@ public class MainActivity extends Activity {
         if (data == null || data.length < 3 || (data[0] & 0xFF) != 0xA1) {
             return;
         }
+        String clean = toHex(data).replace(" ", "");
+        if (clean.startsWith("A1010100000002")
+                || clean.startsWith("A1020100000002")
+                || clean.startsWith("A1010200000001")
+                || clean.startsWith("A1010100000003")
+                || clean.startsWith("A1020100000003")
+                || clean.startsWith("A1010200000003")) {
+            return;
+        }
 
         int channel = data[1] & 0xFF;
         int state = data[2] & 0xFF;
@@ -1546,6 +1684,12 @@ public class MainActivity extends Activity {
     }
 
     private void onLimitActive(Direction limitDirection) {
+        long now = System.currentTimeMillis();
+        if (motorSafetyInitInProgress
+                && now - motorSafetySeekStartedAtMs < MOTOR_INIT_LIMIT_DEBOUNCE_MS) {
+            appendLogSafe("Init: ignored early limit " + directionName(limitDirection));
+            return;
+        }
         blockedDirection = limitDirection;
         String message = directionName(limitDirection) + " limit active";
         appendLogSafe(message);
@@ -1554,6 +1698,31 @@ public class MainActivity extends Activity {
             cancelScheduledCommands();
             currentDirection = Direction.NONE;
             sendCommand("LIMIT STOP", CMD_STOP);
+        }
+        if (motorSafetyInitInProgress) {
+            runOnUiThread(() -> {
+                if (autoText != null) {
+                    autoText.setText("Init: low limit active");
+                }
+                setStatus("Init: low limit active");
+            });
+            return;
+        }
+        if (motorSafetyBackoffInProgress) {
+            if (limitDirection == motorSafetyBackoffOriginLimit) {
+                appendLogSafe("Init backoff: leaving origin limit " + directionName(limitDirection));
+                return;
+            }
+            motorSafetyBackoffInProgress = false;
+            motorSafetyBackoffOriginLimit = Direction.NONE;
+            triggerSafetyVibration("Init backoff hit limit");
+            runOnUiThread(() -> {
+                if (autoText != null) {
+                    autoText.setText("Init: stopped by opposite limit");
+                }
+                setStatus("Init stopped by limit");
+            });
+            return;
         }
         if (autoTuning) {
             autoTuning = false;
@@ -1648,7 +1817,7 @@ public class MainActivity extends Activity {
     @SuppressLint("MissingPermission")
     private void sendCommand(String label, String rawHex) {
         if (gatt == null || writeCharacteristic == null) {
-            toast("Connect first");
+            toast("请先连接蓝牙电机板");
             return;
         }
         if (!hasConnectPermission()) {
@@ -1726,6 +1895,25 @@ public class MainActivity extends Activity {
                 && (data[2] & 0xFF) == 0x01;
     }
 
+    private String printableAscii(byte[] data) {
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        StringBuilder builder = new StringBuilder(data.length);
+        for (byte b : data) {
+            int value = b & 0xFF;
+            if (value == '\r' || value == '\n' || value == '\t') {
+                builder.append((char) value);
+                continue;
+            }
+            if (value < 0x20 || value > 0x7E) {
+                return null;
+            }
+            builder.append((char) value);
+        }
+        return builder.toString();
+    }
+
     @SuppressLint("MissingPermission")
     private void startPitchListening() {
         if (listening) {
@@ -1763,11 +1951,13 @@ public class MainActivity extends Activity {
                 if (read > 1024) {
                     double frequency = detectPitchYin(buffer, read);
                     float level = computeLevel(buffer, read);
+                    short[] waveformBuffer = new short[read];
+                    System.arraycopy(buffer, 0, waveformBuffer, 0, read);
                     if (frequency > 0) {
-                        updatePitch(frequency, level, buffer, read);
+                        updatePitch(frequency, level, waveformBuffer, read);
                     } else if (tunerView != null) {
                         runOnUiThread(() -> {
-                            tunerView.setLevel(level);
+                            tunerView.setWaveform(level, waveformBuffer, read);
                             updatePianoScanNoPitch(level);
                         });
                     }
@@ -1895,18 +2085,19 @@ public class MainActivity extends Activity {
             pitchText.setText(String.format(Locale.US, "Pitch: %s  %.1f Hz", note, frequency));
             targetText.setText(String.format(Locale.US, "Target: %s %.1f Hz   %.1f cents", note, target, cents));
             if (!pitchReady) {
-                tunerView.setLevel(level);
+                tunerView.setWaveform(level, buffer, size);
                 updatePianoScanUnstable(level);
             } else if (alarmReady) {
                 tunerView.setOutOfRangePitch(note, frequency, target, cents, level, buffer, size);
                 triggerPitchRangeAlarm();
             } else if (outOfRange) {
-                tunerView.setLevel(level);
+                tunerView.setWaveform(level, buffer, size);
             } else {
                 tunerView.setPitch(note, frequency, target, cents, level, buffer, size);
             }
             if (pitchReady) {
                 handlePianoScanPitch(frequency, midi, cents);
+                handleArmedAutoTunePitch(midi, cents);
             }
         });
     }
@@ -1949,8 +2140,211 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void triggerSafetyVibration(String reason) {
+        long now = System.currentTimeMillis();
+        if (now - lastSafetyVibrateMs < SAFETY_VIBRATION_COOLDOWN_MS) {
+            return;
+        }
+        lastSafetyVibrateMs = now;
+        appendLog(reason);
+        Vibrator vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+        if (vibrator == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createWaveform(
+                    new long[]{0, 120, 80, 120, 80, 180},
+                    new int[]{0, 220, 0, 220, 0, 255},
+                    -1
+            ));
+        } else {
+            vibrator.vibrate(new long[]{0, 120, 80, 120, 80, 180}, -1);
+        }
+    }
+
     private void selectTargetMidi(int midi) {
         selectTargetMidi(midi, true);
+    }
+
+    private void handleVirtualPianoKeySelected(int midi) {
+        int targetMidi = Math.max(21, Math.min(108, midi));
+        if (pianoScanActive) {
+            selectTargetMidi(targetMidi, true);
+            return;
+        }
+        if (motorSafetyInitInProgress || motorSafetyBackoffInProgress) {
+            toast("Motor initialization is running");
+            return;
+        }
+        if (motorSafetyInitialized && motorSafetyInitializedMidi == targetMidi) {
+            selectTargetMidi(targetMidi, true);
+            armAutoTuneForPianoStrike(targetMidi);
+            return;
+        }
+        showRemoveWrenchDialog(targetMidi);
+    }
+
+    private void showRemoveWrenchDialog(int midi) {
+        String note = noteName(midi);
+        new AlertDialog.Builder(this)
+                .setTitle("取下扳手")
+                .setMessage("准备调 " + note + "。\n\n"
+                        + "请先取下扳手，确认电机和机构可以空载移动。\n\n"
+                        + "确认后电机会先向低音侧移动到微动限位开关，再反向转动 10 圈定位。定位完成后再放入扳手。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("确认，开始初始化", (dialog, which) -> startMotorSafetyInitialization(midi))
+                .show();
+    }
+
+    private void startMotorSafetyInitialization(int midi) {
+        if (gatt == null || writeCharacteristic == null) {
+            toast("请先连接蓝牙电机板");
+            showMotorDialog("请先连接蓝牙电机板");
+            return;
+        }
+        stopAutoTune(true);
+        selectTargetMidi(midi, false);
+        motorSafetyInitialized = false;
+        motorSafetyInitializedMidi = midi;
+        motorSafetyInitInProgress = true;
+        motorSafetyBackoffInProgress = false;
+        blockedDirection = Direction.NONE;
+        motorSafetyBackoffOriginLimit = Direction.NONE;
+        motorPositionRevFromLow = Double.NaN;
+        autoArmedForPianoStrike = false;
+        if (autoText != null) {
+            autoText.setText("Init: ESP32 will seek low limit");
+        }
+        setStatus("Init: sending ESP32 HOME command");
+        beginCommandSequence();
+        int generation = commandGeneration;
+        motorSafetySeekStartedAtMs = System.currentTimeMillis();
+        sendCommand("ESP32 HOME", CMD_HOME);
+        handler.postDelayed(() -> {
+            if (generation == commandGeneration && motorSafetyInitInProgress) {
+                cancelScheduledCommands();
+                motorSafetyInitInProgress = false;
+                currentDirection = Direction.NONE;
+                sendCommand("INIT SEEK TIMEOUT STOP", CMD_STOP);
+                triggerSafetyVibration("Init seek timeout");
+                setStatus("Init timeout: low limit not found");
+                if (autoText != null) {
+                    autoText.setText("Init: timeout, check limit switch");
+                }
+            }
+        }, MOTOR_INIT_SEEK_TIMEOUT_MS);
+    }
+
+    private void startMotorSafetyBackoff() {
+        motorSafetyInitInProgress = false;
+        motorSafetyBackoffInProgress = true;
+        if (autoText != null) {
+            autoText.setText("Init: low limit found, backing off 10 rev");
+        }
+        setStatus("Init: backing off 10 rev");
+        beginCommandSequence();
+        if (!prepareMotion("INIT BACKOFF RIGHT", CMD_RIGHT)) {
+            motorSafetyBackoffInProgress = false;
+            return;
+        }
+        int generation = commandGeneration;
+        startInitContinuousMotion(
+                "INIT BACKOFF RIGHT CONTINUOUS",
+                CMD_RIGHT,
+                () -> generation == commandGeneration,
+                generation
+        );
+        long backoffMs = Math.round(MOTOR_INIT_BACKOFF_REV * EXPERIENCE_REV_MS);
+        handler.postDelayed(() -> finishMotorSafetyInitialization(generation), backoffMs);
+    }
+
+    private void startInitContinuousMotion(String label, String hex, MotionActiveCheck activeCheck, int generation) {
+        startContinuousCommand(label, hex, activeCheck, generation);
+    }
+
+    private void startContinuousCommand(String label, String hex, MotionActiveCheck activeCheck, int generation) {
+        if (generation != commandGeneration || !activeCheck.isActive()) {
+            return;
+        }
+        sendCommand(label, hex);
+        activeMotionRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (generation != commandGeneration || !activeCheck.isActive()) {
+                    return;
+                }
+                sendCommand(label + " keep", hex);
+                handler.postDelayed(this, 130L);
+            }
+        };
+        handler.postDelayed(activeMotionRunnable, 130L);
+    }
+
+    private interface MotionActiveCheck {
+        boolean isActive();
+    }
+
+    private void finishMotorSafetyInitialization(int generation) {
+        if (generation != commandGeneration || !motorSafetyBackoffInProgress) {
+            return;
+        }
+        cancelScheduledCommands();
+        motorSafetyBackoffInProgress = false;
+        motorSafetyBackoffOriginLimit = Direction.NONE;
+        motorSafetyInitialized = true;
+        motorPositionRevFromLow = MOTOR_INIT_BACKOFF_REV;
+        currentDirection = Direction.NONE;
+        sendCommand("INIT BACKOFF STOP", CMD_STOP);
+        setStatus("Init complete: insert wrench");
+        if (autoText != null) {
+            autoText.setText("Init: complete, insert wrench");
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("放入扳手")
+                .setMessage("初始化完成。\n\n"
+                        + "现在请放入扳手，然后点击 APP 虚拟键盘上的 "
+                        + noteName(motorSafetyInitializedMidi)
+                        + "，再按下实体钢琴键。软件会确认钢琴音后才启动调律。")
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
+    private void finishMotorSafetyInitializationFromEsp32() {
+        if (!motorSafetyInitInProgress && !motorSafetyBackoffInProgress) {
+            return;
+        }
+        commandGeneration++;
+        motorSafetyInitInProgress = false;
+        motorSafetyBackoffInProgress = false;
+        motorSafetyBackoffOriginLimit = Direction.NONE;
+        motorSafetyInitialized = true;
+        motorPositionRevFromLow = MOTOR_INIT_BACKOFF_REV;
+        currentDirection = Direction.NONE;
+        setStatus("Init complete: insert wrench");
+        if (autoText != null) {
+            autoText.setText("Init: complete, insert wrench");
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("放入扳手")
+                .setMessage("初始化完成。\n\n"
+                        + "现在请放入扳手，然后点击 APP 虚拟键盘上的 "
+                        + noteName(motorSafetyInitializedMidi)
+                        + "，再按下实体钢琴键。")
+                .setPositiveButton("知道了", null)
+                .show();
+    }
+
+    private void armAutoTuneForPianoStrike(int midi) {
+        autoArmedForPianoStrike = true;
+        autoTargetMidi = midi;
+        autoTargetFrequency = targetFrequencyForMidi(midi);
+        autoIgnorePitchBeforeMs = System.currentTimeMillis() + 250L;
+        pitchCandidateFrames = 0;
+        if (autoText != null) {
+            autoText.setText("Ready: press the physical piano key");
+        }
+        setStatus("Ready: press physical " + noteName(midi));
+        toast("Press the physical piano key");
     }
 
     private void selectTargetMidi(int midi, boolean playPreview) {
@@ -2011,7 +2405,128 @@ public class MainActivity extends Activity {
     private boolean hasFreshStablePitchForTarget(int midi) {
         return latestStableFrequency > 0
                 && System.currentTimeMillis() - latestStablePitchMs < 2500
-                && Math.abs(latestStableMidi - midi) <= AUTO_NOTE_WINDOW_SEMITONES;
+                && isConfirmedTargetKey(midi, latestStableMidi);
+    }
+
+    private boolean hasNewStablePitchForTarget(int midi, long afterMs) {
+        return hasFreshStablePitchForTarget(midi) && latestStablePitchMs >= afterMs;
+    }
+
+    private boolean hasFreshStablePitch() {
+        return latestStableFrequency > 0 && System.currentTimeMillis() - latestStablePitchMs < 2500;
+    }
+
+    private boolean isConfirmedTargetKey(int targetMidi, int detectedMidi) {
+        return Math.abs(detectedMidi - targetMidi) <= WRONG_KEY_ALLOWED_SEMITONES;
+    }
+
+    private void handleArmedAutoTunePitch(int detectedMidi, double cents) {
+        if (!autoArmedForPianoStrike || System.currentTimeMillis() < autoIgnorePitchBeforeMs) {
+            return;
+        }
+        if (!isConfirmedTargetKey(autoTargetMidi, detectedMidi)) {
+            triggerSafetyVibration("Wrong key");
+            autoText.setText("Wrong key: heard " + noteName(detectedMidi) + ", target " + noteName(autoTargetMidi));
+            setStatus("Wrong key: press " + noteName(autoTargetMidi));
+            return;
+        }
+        if (!isCentsWithinMotorRange(autoTargetMidi, cents)) {
+            triggerSafetyVibration("Pitch out of motor range");
+            autoText.setText(String.format(Locale.US, "Out of range: %+.1f cents", cents));
+            setStatus("Pitch out of motor range");
+            return;
+        }
+        autoArmedForPianoStrike = false;
+        startAutoTune();
+    }
+
+    private double availableRevForDirection(Direction direction) {
+        double position = Double.isNaN(motorPositionRevFromLow) ? MOTOR_INIT_BACKOFF_REV : motorPositionRevFromLow;
+        if (direction == Direction.RIGHT) {
+            return Math.max(0.0, MOTOR_TOTAL_TRAVEL_REV - position);
+        }
+        if (direction == Direction.LEFT) {
+            return Math.max(0.0, position);
+        }
+        return 0.0;
+    }
+
+    private boolean isCentsWithinMotorRange(int midi, double cents) {
+        Direction needed = cents < 0 ? Direction.RIGHT : Direction.LEFT;
+        double availableRev = availableRevForDirection(needed);
+        double maxCents = experienceBaseCentsPerRev(midi) * experienceScaleForMidi(midi) * availableRev;
+        return Math.abs(cents) <= maxCents + autoToleranceCents;
+    }
+
+    private double experienceBaseCentsPerRev(int midi) {
+        int clamped = Math.max(EXPERIENCE_CURVE_MIDI[0],
+                Math.min(EXPERIENCE_CURVE_MIDI[EXPERIENCE_CURVE_MIDI.length - 1], midi));
+        for (int i = 0; i < EXPERIENCE_CURVE_MIDI.length - 1; i++) {
+            int leftMidi = EXPERIENCE_CURVE_MIDI[i];
+            int rightMidi = EXPERIENCE_CURVE_MIDI[i + 1];
+            if (clamped <= rightMidi) {
+                double t = (clamped - leftMidi) / (double) (rightMidi - leftMidi);
+                return EXPERIENCE_CURVE_CENTS_PER_REV[i]
+                        + (EXPERIENCE_CURVE_CENTS_PER_REV[i + 1] - EXPERIENCE_CURVE_CENTS_PER_REV[i]) * t;
+            }
+        }
+        return EXPERIENCE_CURVE_CENTS_PER_REV[EXPERIENCE_CURVE_CENTS_PER_REV.length - 1];
+    }
+
+    private double experienceScaleForMidi(int midi) {
+        if (midi < 21 || midi > 108 || autoExperienceScale[midi] <= 0) {
+            return 1.0;
+        }
+        return autoExperienceScale[midi];
+    }
+
+    private double experienceCentsPerSecond(int midi) {
+        double revPerSecond = EXPERIENCE_MOTOR_RPM / 60.0;
+        return Math.max(0.1, experienceBaseCentsPerRev(midi) * experienceScaleForMidi(midi) * revPerSecond);
+    }
+
+    private int experienceDurationMs(int midi, double centsError) {
+        double rawMs = Math.abs(centsError) / experienceCentsPerSecond(midi) * 1000.0;
+        return clampInt((int) Math.round(rawMs), EXPERIENCE_MIN_PULSE_MS, autoExperienceMaxPulseMs);
+    }
+
+    private void learnExperienceScale(double currentCents) {
+        if (autoLastDirection == Direction.NONE || Math.abs(autoLastExpectedDeltaCents) < 0.1) {
+            return;
+        }
+        double actualDelta = currentCents - autoLastObservedCents;
+        if (Math.signum(actualDelta) != Math.signum(autoLastExpectedDeltaCents) || Math.abs(actualDelta) < 0.2) {
+            if (Math.abs(actualDelta) >= 0.2
+                    && Math.signum(actualDelta) == -Math.signum(autoLastExpectedDeltaCents)) {
+                Direction oldRaise = autoRaiseDirection;
+                autoRaiseDirection = autoLowerDirection;
+                autoLowerDirection = oldRaise;
+                appendLog(String.format(Locale.US,
+                        "Auto direction reversed: expected %+.2f cents, actual %+.2f cents",
+                        autoLastExpectedDeltaCents,
+                        actualDelta));
+                autoText.setText("Auto: direction reversed from last result");
+                return;
+            }
+            appendLog(String.format(Locale.US,
+                    "Auto learn skipped: expected %+.2f cents, actual %+.2f cents",
+                    autoLastExpectedDeltaCents,
+                    actualDelta));
+            return;
+        }
+        double measuredFactor = Math.abs(actualDelta / autoLastExpectedDeltaCents);
+        measuredFactor = clampDouble(measuredFactor, 0.25, 4.0);
+        double oldScale = experienceScaleForMidi(autoTargetMidi);
+        double newScale = clampDouble(oldScale * 0.65 + oldScale * measuredFactor * 0.35, 0.25, 4.0);
+        autoExperienceScale[autoTargetMidi] = newScale;
+        saveCalibrationSettings();
+        appendLog(String.format(Locale.US,
+                "Auto learn %s: expected %+.2f, actual %+.2f, scale %.3f -> %.3f",
+                noteName(autoTargetMidi),
+                autoLastExpectedDeltaCents,
+                actualDelta,
+                oldScale,
+                newScale));
     }
 
     private void startAutoTune() {
@@ -2023,10 +2538,21 @@ public class MainActivity extends Activity {
             startPitchListening();
         }
         if (gatt == null || writeCharacteristic == null) {
-            toast("Connect Bluetooth first");
+            toast("请先连接蓝牙电机板");
             return;
         }
         int targetMidi = selectedTargetMidi > 0 ? selectedTargetMidi : latestMidi;
+        if (!motorSafetyInitialized || motorSafetyInitializedMidi != targetMidi) {
+            toast("请先点击虚拟键并完成电机初始化");
+            autoText.setText("自动：请先初始化电机");
+            showRemoveWrenchDialog(targetMidi);
+            return;
+        }
+        if (hasFreshStablePitch() && !isConfirmedTargetKey(targetMidi, latestStableMidi)) {
+            triggerSafetyVibration("Wrong key");
+            autoText.setText("Wrong key: heard " + noteName(latestStableMidi));
+            return;
+        }
         if (!hasFreshStablePitchForTarget(targetMidi)) {
             toast("Play the selected key until pitch is stable");
             autoText.setText("Auto: waiting for stable selected key");
@@ -2039,13 +2565,19 @@ public class MainActivity extends Activity {
         autoStepCount = 0;
         autoTargetMidi = targetMidi;
         autoTargetFrequency = targetFrequencyForMidi(autoTargetMidi);
-        autoProbeFrequency = latestStableFrequency;
-        autoRaiseDirection = Direction.NONE;
-        autoLowerDirection = Direction.NONE;
-        autoText.setText("Auto: probing left direction");
-        appendLog("Auto target " + noteName(autoTargetMidi) + " " + autoTargetFrequency);
-        autoPulse(Direction.LEFT, autoProbeMs);
-        scheduleAuto(this::finishAutoProbe, autoProbeMs + autoSettleMs);
+        autoRaiseDirection = Direction.RIGHT;
+        autoLowerDirection = Direction.LEFT;
+        autoWaitingForRestrike = false;
+        autoLastDirection = Direction.NONE;
+        autoIgnorePitchBeforeMs = 0;
+        autoArmedForPianoStrike = false;
+        autoText.setText("Auto: experience model ready");
+        appendLog(String.format(Locale.US,
+                "Auto experience target %s %.2f Hz, curve %.3f cents/rev",
+                noteName(autoTargetMidi),
+                autoTargetFrequency,
+                experienceBaseCentsPerRev(autoTargetMidi)));
+        applyExperienceAdjustment(false);
     }
 
     private void finishAutoProbe() {
@@ -2081,6 +2613,22 @@ public class MainActivity extends Activity {
         if (!autoTuning) {
             return;
         }
+        if (autoWaitingForRestrike) {
+            if (!hasNewStablePitchForTarget(autoTargetMidi, autoIgnorePitchBeforeMs)) {
+                autoText.setText("Auto: play the physical key again");
+                scheduleAuto(this::autoAdjustLoop, 350);
+                return;
+            }
+            applyExperienceAdjustment(true);
+            return;
+        }
+        applyExperienceAdjustment(false);
+    }
+
+    private void applyExperienceAdjustment(boolean learnFromLastMove) {
+        if (!autoTuning) {
+            return;
+        }
         if (++autoStepCount > autoMaxStepsSetting) {
             autoText.setText("Auto: stopped, max steps");
             stopAutoTune(true);
@@ -2093,9 +2641,22 @@ public class MainActivity extends Activity {
         }
 
         double cents = centsBetween(latestStableFrequency, autoTargetFrequency);
-        if (Math.abs(cents) <= autoToleranceCents) {
-            autoText.setText(String.format(Locale.US, "Auto: done %.1f cents", cents));
+        if (learnFromLastMove) {
+            learnExperienceScale(cents);
+        }
+        if (!isCentsWithinMotorRange(autoTargetMidi, cents)) {
+            triggerSafetyVibration("Pitch out of motor range");
+            autoText.setText(String.format(Locale.US, "Auto: out of range %+.1f cents", cents));
             stopAutoTune(true);
+            return;
+        }
+        if (Math.abs(cents) <= autoToleranceCents) {
+            String doneMessage = String.format(Locale.US, "Auto: done %.1f cents", cents);
+            if (tunerView != null) {
+                tunerView.showCalibrationComplete();
+            }
+            stopAutoTune(true);
+            autoText.setText(doneMessage);
             return;
         }
 
@@ -2106,13 +2667,44 @@ public class MainActivity extends Activity {
             return;
         }
 
-        int duration = Math.abs(cents) > 25 ? autoPulseLongMs : Math.abs(cents) > 10 ? autoPulseMediumMs : autoPulseShortMs;
-        autoText.setText(String.format(Locale.US, "Auto: %.1f cents, pulse %s", cents, directionName(direction)));
-        if (!autoPulse(direction, duration)) {
+        int correctionMs = experienceDurationMs(autoTargetMidi, cents);
+        int preloadMs = direction == autoRaiseDirection
+                ? (int) Math.round(autoPreloadLowRev * EXPERIENCE_REV_MS)
+                : 0;
+        preloadMs = Math.min(preloadMs, (int) Math.floor(availableRevForDirection(autoLowerDirection) * EXPERIENCE_REV_MS));
+        int duration = correctionMs + preloadMs;
+        int availableMs = (int) Math.floor(availableRevForDirection(direction) * EXPERIENCE_REV_MS);
+        if (duration > availableMs) {
+            duration = availableMs;
+        }
+        int netCorrectionMs = direction == autoRaiseDirection ? duration - preloadMs : duration;
+        if (duration < EXPERIENCE_MIN_PULSE_MS || netCorrectionMs < EXPERIENCE_MIN_PULSE_MS) {
+            triggerSafetyVibration("Motor travel exhausted");
+            autoText.setText("Auto: motor travel exhausted");
             stopAutoTune(true);
             return;
         }
-        scheduleAuto(this::autoAdjustLoop, duration + autoSettleMs);
+        double centsPerSecond = experienceCentsPerSecond(autoTargetMidi);
+        double expectedCents = centsPerSecond * netCorrectionMs / 1000.0;
+        autoLastExpectedDeltaCents = direction == autoRaiseDirection ? expectedCents : -expectedCents;
+        autoLastObservedCents = cents;
+        autoLastDurationMs = duration;
+        autoLastDirection = direction;
+        autoText.setText(String.format(Locale.US,
+                "Auto: %+.1f cents, preload %.1f rev, %s %d ms (%.2f cents/rev)",
+                cents,
+                preloadMs / EXPERIENCE_REV_MS,
+                directionName(direction),
+                duration,
+                centsPerSecond));
+        int totalMotionMs = preloadMs + duration;
+        if (!autoPulseWithPreload(direction, duration, preloadMs)) {
+            stopAutoTune(true);
+            return;
+        }
+        autoWaitingForRestrike = true;
+        autoIgnorePitchBeforeMs = System.currentTimeMillis() + totalMotionMs + EXPERIENCE_RESTRIKE_ARM_MS;
+        scheduleAuto(this::autoAdjustLoop, totalMotionMs + autoSettleMs);
     }
 
     private boolean autoPulse(Direction direction, int durationMs) {
@@ -2125,11 +2717,71 @@ public class MainActivity extends Activity {
         int generation = autoGeneration;
         handler.postDelayed(() -> {
             if (generation == autoGeneration) {
+                updateMotorPositionAfterMove(direction, durationMs);
                 currentDirection = Direction.NONE;
                 sendCommand("AUTO STOP", CMD_STOP);
             }
         }, durationMs);
         return true;
+    }
+
+    private boolean autoPulseWithPreload(Direction direction, int durationMs, int preloadMs) {
+        if (preloadMs <= 0) {
+            return autoPulse(direction, durationMs);
+        }
+        if (autoLowerDirection == Direction.NONE || direction == Direction.NONE) {
+            return false;
+        }
+        cancelScheduledCommands();
+        String preloadHex = autoLowerDirection == Direction.LEFT ? CMD_LEFT : CMD_RIGHT;
+        String finalHex = direction == Direction.LEFT ? CMD_LEFT : CMD_RIGHT;
+        if (!prepareMotion("AUTO PRELOAD " + directionName(autoLowerDirection), preloadHex)) {
+            return false;
+        }
+        sendCommand("AUTO PRELOAD " + directionName(autoLowerDirection), preloadHex);
+        int generation = autoGeneration;
+        handler.postDelayed(() -> {
+            if (generation == autoGeneration) {
+                updateMotorPositionAfterMove(autoLowerDirection, preloadMs);
+                currentDirection = Direction.NONE;
+                sendCommand("AUTO PRELOAD STOP", CMD_STOP);
+            }
+        }, preloadMs);
+        handler.postDelayed(() -> {
+            if (generation == autoGeneration) {
+                if (!prepareMotion("AUTO " + directionName(direction), finalHex)) {
+                    stopAutoTune(true);
+                    return;
+                }
+                sendCommand("AUTO " + directionName(direction), finalHex);
+            }
+        }, preloadMs + 130L);
+        handler.postDelayed(() -> {
+            if (generation == autoGeneration) {
+                updateMotorPositionAfterMove(direction, durationMs);
+                currentDirection = Direction.NONE;
+                sendCommand("AUTO STOP", CMD_STOP);
+            }
+        }, preloadMs + 130L + durationMs);
+        return true;
+    }
+
+    private void updateMotorPositionAfterMove(Direction direction, int durationMs) {
+        if (direction == Direction.NONE) {
+            return;
+        }
+        double position = Double.isNaN(motorPositionRevFromLow) ? MOTOR_INIT_BACKOFF_REV : motorPositionRevFromLow;
+        double movedRev = durationMs / EXPERIENCE_REV_MS;
+        if (direction == Direction.RIGHT) {
+            position += movedRev;
+        } else if (direction == Direction.LEFT) {
+            position -= movedRev;
+        }
+        motorPositionRevFromLow = clampDouble(position, 0.0, MOTOR_TOTAL_TRAVEL_REV);
+        appendLog(String.format(Locale.US,
+                "Motor position %.2f/%.0f rev from low limit",
+                motorPositionRevFromLow,
+                MOTOR_TOTAL_TRAVEL_REV));
     }
 
     private void scheduleAuto(Runnable runnable, long delayMs) {
@@ -2144,8 +2796,10 @@ public class MainActivity extends Activity {
     private void stopAutoTune(boolean sendStop) {
         autoTuning = false;
         autoGeneration++;
+        autoWaitingForRestrike = false;
+        autoLastDirection = Direction.NONE;
         currentDirection = Direction.NONE;
-        if (autoText != null) {
+        if (autoText != null && !"Auto: done".contentEquals(autoText.getText())) {
             autoText.setText("Auto: idle");
         }
         if (sendStop && gatt != null && writeCharacteristic != null) {
@@ -2154,8 +2808,42 @@ public class MainActivity extends Activity {
     }
 
     private String deviceLabel(BluetoothDevice device) {
-        String name = hasConnectPermission() ? device.getName() : null;
+        String name = safeDeviceName(device);
         return ((name == null || name.length() == 0) ? "(no name)" : name) + " / " + device.getAddress();
+    }
+
+    @SuppressLint("MissingPermission")
+    private String safeDeviceName(BluetoothDevice device) {
+        if (device == null || !hasConnectPermission()) {
+            return null;
+        }
+        try {
+            return device.getName();
+        } catch (SecurityException ex) {
+            return null;
+        }
+    }
+
+    private boolean isTargetMotorName(String name) {
+        if (name == null) {
+            return false;
+        }
+        String normalized = name.trim().toUpperCase(Locale.US);
+        return normalized.equals(TARGET_NAME.toUpperCase(Locale.US));
+    }
+
+    private String firstNonEmpty(String first, String second) {
+        if (first != null && first.trim().length() > 0) {
+            return first;
+        }
+        if (second != null && second.trim().length() > 0) {
+            return second;
+        }
+        return null;
+    }
+
+    private String valueOrDash(String value) {
+        return value == null || value.trim().length() == 0 ? "-" : value;
     }
 
     private void requestNeededPermissions() {
@@ -2163,9 +2851,8 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             permissions.add(Manifest.permission.BLUETOOTH_SCAN);
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT);
-        } else {
-            permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
         }
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
         permissions.add(Manifest.permission.RECORD_AUDIO);
 
         List<String> missing = new ArrayList<>();
@@ -2189,7 +2876,8 @@ public class MainActivity extends Activity {
 
     private boolean hasScanPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED;
+            return checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
         }
         return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
     }
@@ -2620,6 +3308,7 @@ public class MainActivity extends Activity {
         private final RectF skinDst = new RectF();
         private final RectF selectedKeyBounds = new RectF();
         private final RectF overlayDst = new RectF();
+        private final RectF waveformBounds = new RectF();
         private final RectF keyboardImageDst = new RectF();
         private final Rect bitmapSrc = new Rect();
         private final short[] wave = new short[192];
@@ -2628,7 +3317,6 @@ public class MainActivity extends Activity {
         private static final float BLACK_TOP = 0f;
         private static final float BLACK_BOTTOM = 178f;
         private static final float MIDDLE_DIAL_RADIUS_RATIO = 318f / 390f;
-        private static final float INNER_DIAL_RADIUS_RATIO = 269f / 390f;
         private static final float[] BLACK_LEFT = {
                 56f, 169f, 237f, 343f, 421f, 487f, 604f, 672f, 778f, 856f, 914f, 1037f,
                 1106f, 1220f, 1290f, 1356f, 1468f, 1529f, 1652f, 1713f, 1787f, 1902f,
@@ -2647,12 +3335,8 @@ public class MainActivity extends Activity {
                 80, 82, 85, 87, 90, 92, 94, 97, 99, 102, 104, 106
         };
         private final Bitmap skinBitmap;
-        private final Bitmap centerBitmap;
         private final Bitmap topKeyBitmap;
-        private final Bitmap needleBitmap;
         private final Bitmap rotatingDialBitmap;
-        private final Bitmap rotatingMiddleBitmap;
-        private final Bitmap rotatingInnerBitmap;
         private final Bitmap fullKeyboardBitmap;
         private final Bitmap pressBlackBitmap;
         private final Bitmap pressWhiteBitmap;
@@ -2677,18 +3361,15 @@ public class MainActivity extends Activity {
         private long lastFrameMs;
         private long rangeAlarmStartedMs;
         private long rangeAlarmUntilMs;
+        private long calibrationCompleteUntilMs;
 
         SteampunkTunerView(Context context, NoteSelectionListener selectionListener, Runnable menuListener) {
             super(context);
             this.selectionListener = selectionListener;
             this.menuListener = menuListener;
             skinBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.max_style_skin);
-            centerBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.center_circle);
             topKeyBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.top_key);
-            needleBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.needle_pointer);
             rotatingDialBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.rotating_dial);
-            rotatingMiddleBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.dial_middle_q);
-            rotatingInnerBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.dial_inner_q2);
             fullKeyboardBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.full_keyboard);
             pressBlackBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.key_black_pressed);
             pressWhiteBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.key_white_pressed);
@@ -2713,6 +3394,17 @@ public class MainActivity extends Activity {
             invalidate();
         }
 
+        void setWaveform(float value, short[] buffer, int size) {
+            level = value;
+            copyWaveform(buffer, size);
+            invalidate();
+        }
+
+        void showCalibrationComplete() {
+            calibrationCompleteUntilMs = System.currentTimeMillis() + 3500L;
+            invalidate();
+        }
+
         void setPitch(String note, double frequency, double target, double cents, float level, short[] buffer, int size) {
             this.note = note;
             this.frequency = frequency;
@@ -2720,10 +3412,7 @@ public class MainActivity extends Activity {
             this.cents = Math.max(-TUNER_DIAL_CENTS_RANGE, Math.min(TUNER_DIAL_CENTS_RANGE, cents));
             targetCents = (float) this.cents;
             this.level = level;
-            int step = Math.max(1, size / wave.length);
-            for (int i = 0; i < wave.length; i++) {
-                wave[i] = buffer[Math.min(size - 1, i * step)];
-            }
+            copyWaveform(buffer, size);
             invalidate();
         }
 
@@ -2734,16 +3423,23 @@ public class MainActivity extends Activity {
             this.cents = Math.max(-TUNER_DIAL_CENTS_RANGE, Math.min(TUNER_DIAL_CENTS_RANGE, cents));
             targetCents = cents < 0 ? (float) -TUNER_DIAL_CENTS_RANGE : (float) TUNER_DIAL_CENTS_RANGE;
             this.level = level;
-            int step = Math.max(1, size / wave.length);
-            for (int i = 0; i < wave.length; i++) {
-                wave[i] = buffer[Math.min(size - 1, i * step)];
-            }
+            copyWaveform(buffer, size);
             long now = System.currentTimeMillis();
             if (now > rangeAlarmUntilMs) {
                 rangeAlarmStartedMs = now;
             }
             rangeAlarmUntilMs = now + 1400L;
             invalidate();
+        }
+
+        private void copyWaveform(short[] buffer, int size) {
+            if (buffer == null || size <= 0) {
+                return;
+            }
+            int step = Math.max(1, size / wave.length);
+            for (int i = 0; i < wave.length; i++) {
+                wave[i] = buffer[Math.min(size - 1, i * step)];
+            }
         }
 
         @Override
@@ -2791,7 +3487,8 @@ public class MainActivity extends Activity {
             rightGroupBounds.set(left + sw * 0.83f, top + sh * 0.574f, left + sw * 1.00f, top + sh * 0.636f);
             keyboardBounds.set(left, top + sh * 0.636f, left + sw, top + sh * 0.965f);
 
-            drawRotatingDialLayer(canvas, dialCx, dialCy, sw * 0.465f);
+            drawStaticDialLayer(canvas, dialCx, dialCy, sw * 0.465f);
+            drawSkinnedWaveformDisplay(canvas, dialCx, dialCy + dpLocal(7), sw * 0.465f * MIDDLE_DIAL_RADIUS_RATIO);
             drawSkinnedFullKeyboard(canvas);
             drawSkinnedKeyHighlight(canvas);
             drawSkinnedGroupLabel(canvas, left, top, sw, sh);
@@ -2800,26 +3497,88 @@ public class MainActivity extends Activity {
             drawSkinnedCenter(canvas, dialCx, dialCy + dpLocal(10), sw * 0.162f);
         }
 
-        private void drawRotatingDialLayer(Canvas canvas, float cx, float cy, float radius) {
+        private void drawStaticDialLayer(Canvas canvas, float cx, float cy, float radius) {
             paint.setAlpha(255);
             float layerCy = cy + dpLocal(7);
-            float pitchRotation = -displayCents * TUNER_DIAL_DEGREES_PER_CENT;
-            drawRotatingBitmap(canvas, rotatingDialBitmap, cx, layerCy, radius, pitchRotation);
-            drawRotatingBitmap(canvas, rotatingMiddleBitmap, cx, layerCy, radius * MIDDLE_DIAL_RADIUS_RATIO,
-                    -pitchRotation - gearRotationDegrees * 0.155f);
-            drawRotatingBitmap(canvas, rotatingInnerBitmap, cx, layerCy, radius * INNER_DIAL_RADIUS_RATIO,
-                    pitchRotation + gearRotationDegrees * 0.29f);
+            drawStaticBitmap(canvas, rotatingDialBitmap, cx, layerCy, radius);
         }
 
-        private void drawRotatingBitmap(Canvas canvas, Bitmap bitmap, float cx, float cy, float radius, float degrees) {
+        private void drawStaticBitmap(Canvas canvas, Bitmap bitmap, float cx, float cy, float radius) {
             if (bitmap == null) {
                 return;
             }
             overlayDst.set(cx - radius, cy - radius, cx + radius, cy + radius);
-            canvas.save();
-            canvas.rotate(degrees, cx, cy);
             canvas.drawBitmap(bitmap, null, overlayDst, paint);
-            canvas.restore();
+        }
+
+        private void drawSkinnedWaveformDisplay(Canvas canvas, float cx, float cy, float radius) {
+            waveformBounds.set(cx - radius, cy - radius, cx + radius, cy + radius);
+            int save = canvas.save();
+            canvas.clipPath(circlePath(cx, cy, radius));
+            boolean complete = System.currentTimeMillis() <= calibrationCompleteUntilMs;
+
+            paint.setShader(new RadialGradient(cx, cy, radius,
+                    complete ? Color.rgb(25, 118, 67) : Color.rgb(18, 28, 30),
+                    complete ? Color.rgb(0, 70, 38) : Color.rgb(4, 8, 10),
+                    Shader.TileMode.CLAMP));
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawCircle(cx, cy, radius, paint);
+            paint.setShader(null);
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(Math.max(1f, radius * 0.006f));
+            paint.setColor(complete ? Color.argb(110, 210, 255, 220) : Color.argb(82, 80, 255, 190));
+            float grid = Math.max(dpLocal(10), radius * 0.18f);
+            for (float gx = cx - radius; gx <= cx + radius; gx += grid) {
+                canvas.drawLine(gx, cy - radius, gx, cy + radius, paint);
+            }
+            for (float gy = cy - radius; gy <= cy + radius; gy += grid) {
+                canvas.drawLine(cx - radius, gy, cx + radius, gy, paint);
+            }
+
+            paint.setColor(complete ? Color.argb(210, 220, 255, 225) : Color.argb(150, 135, 255, 210));
+            paint.setStrokeWidth(Math.max(1f, radius * 0.010f));
+            canvas.drawLine(cx - radius * 0.88f, cy, cx + radius * 0.88f, cy, paint);
+
+            paint.setColor(complete ? Color.rgb(0, 255, 76) : Color.rgb(82, 255, 168));
+            paint.setStrokeWidth(Math.max(dpLocal(2), radius * 0.018f));
+            float lastX = cx - radius * 0.90f;
+            float lastY = cy;
+            float gain = 0.32f + Math.min(0.38f, level * 0.55f);
+            for (int i = 0; i < wave.length; i++) {
+                float px = cx - radius * 0.90f + radius * 1.80f * i / (float) (wave.length - 1);
+                float py = complete
+                        ? cy - (float) Math.sin(i * Math.PI * 8.0 / (wave.length - 1)) * radius * 0.36f
+                        : cy - (wave[i] / 32768f) * radius * gain;
+                canvas.drawLine(lastX, lastY, px, py, paint);
+                lastX = px;
+                lastY = py;
+            }
+
+            paint.setStyle(Paint.Style.FILL);
+            paint.setTextAlign(Paint.Align.CENTER);
+            paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            paint.setTextSize(radius * 0.105f);
+            paint.setColor(complete ? Color.WHITE : Color.argb(230, 190, 255, 225));
+            canvas.drawText(complete ? "CALIBRATION COMPLETE" : "Real-time Waveform Display", cx, cy - radius * 0.70f, paint);
+            paint.setTextAlign(Paint.Align.LEFT);
+
+            canvas.restoreToCount(save);
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(Math.max(dpLocal(2), radius * 0.016f));
+            paint.setColor(Color.argb(210, 238, 215, 159));
+            canvas.drawCircle(cx, cy, radius, paint);
+            paint.setStyle(Paint.Style.FILL);
+            if (complete) {
+                postInvalidateDelayed(33);
+            }
+        }
+
+        private android.graphics.Path circlePath(float cx, float cy, float radius) {
+            android.graphics.Path path = new android.graphics.Path();
+            path.addCircle(cx, cy, radius, android.graphics.Path.Direction.CW);
+            return path;
         }
 
         private void drawSkinnedGroupLabel(Canvas canvas, float left, float top, float sw, float sh) {
@@ -3003,10 +3762,13 @@ public class MainActivity extends Activity {
         private void drawSkinnedCenter(Canvas canvas, float cx, float cy, float radius) {
             paint.setAlpha(255);
             paint.setShader(null);
-            if (centerBitmap != null) {
-                overlayDst.set(cx - radius, cy - radius, cx + radius, cy + radius);
-                canvas.drawBitmap(centerBitmap, null, overlayDst, paint);
-            }
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Color.argb(210, 78, 47, 27));
+            canvas.drawCircle(cx, cy, radius, paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(Math.max(dpLocal(2), radius * 0.055f));
+            paint.setColor(Color.argb(230, 238, 215, 159));
+            canvas.drawCircle(cx, cy, radius * 0.94f, paint);
             paint.setStyle(Paint.Style.FILL);
             paint.setTextAlign(Paint.Align.CENTER);
             paint.setColor(Color.rgb(238, 215, 159));
@@ -3018,15 +3780,6 @@ public class MainActivity extends Activity {
         }
 
         private void drawSkinnedTopNeedle(Canvas canvas, float cx, float cy, float radius) {
-            if (needleBitmap != null) {
-                paint.setAlpha(255);
-                float width = radius * 0.14f;
-                float height = width * needleBitmap.getHeight() / (float) needleBitmap.getWidth();
-                float bottom = cy + radius * 0.02f - dpLocal(5);
-                overlayDst.set(cx - width / 2f, bottom - height, cx + width / 2f, bottom);
-                canvas.drawBitmap(needleBitmap, null, overlayDst, paint);
-                return;
-            }
             paint.setAlpha(255);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(Math.max(4f, radius * 0.018f));
