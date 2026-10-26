@@ -34,16 +34,16 @@
     A1 02 01 = high/right limit pressed
     A1 02 02 = high/right limit released
 
-  Motor commands accepted:
-    A1010100000002xx1F = left / low direction hold
-    A1020100000002xx1F = right / high direction hold
+  Motor commands accepted (exact binary lengths; see PROTOCOL.md):
+    A1F100            = capabilities -> SAFE_V2
+    A1F2hhhh          = tagged HOME (nonzero increasing request ID)
+    A1F3hhhh          = protected ratchet return after raising-side end event
+    A1F1ddhhhhpppprrrr = timed sequence: final direction, ID, preload ms, run ms
+    A1010100000002xx1F = left / low manual hold (750ms lease, 30s ceiling)
+    A1020100000002xx1F = right / high manual hold (same lease)
     A10102000000011F   = stop
     A10801xx           = speed, xx is hex speed 0..100
-    A1F001             = ESP32-side home/init:
-                         run left until low limit, then right for 10 seconds.
-
-  Text commands accepted from BLE serial tools:
-    LEFT, RIGHT, STOP, HOME, SPEED 50
+  Text STOP is also accepted. Old untagged HOME/text motion commands are rejected.
 */
 
 #include <Arduino.h>
@@ -52,6 +52,10 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <esp_arduino_version.h>
+#include "MotorSafetyCore.h"
+#include "SafeMotorProtocol.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 // ---------- Pins ----------
 static const int PIN_MOTOR_IN1 = 4;
@@ -90,6 +94,37 @@ static const char *UUID_WRITE = "0000ffe2-0000-1000-8000-00805f9b34fb";
 BLEServer *bleServer = nullptr;
 BLECharacteristic *notifyCharacteristic = nullptr;
 bool bleConnected = false;
+bool controllerHomed = false;
+bool pwmReady = false;
+piano::TimedMove timedMove;
+piano::RatchetReturn ratchetReturn;
+piano::HomeReleaseGuard ratchetLowRelease;
+bool ratchetResultReported = true;
+bool atRatchetLow = false;
+bool timedOriginReleaseFault = false;
+piano::RequestIds requestIds;
+piano::ManualHoldLease manualHold;
+bool timedResultReported = true;
+uint16_t homeRequestId = 0;
+
+// BLE callbacks never mutate PWM, homing, or motion state. A session/STOP epoch
+// prevents queued commands from an old connection or before STOP restarting it.
+struct QueuedCommand {
+  uint8_t data[20];
+  uint8_t size;
+  uint32_t session;
+  uint32_t epoch;
+  uint32_t queuedAtMs;
+};
+QueueHandle_t commandQueue = nullptr;
+portMUX_TYPE linkMux = portMUX_INITIALIZER_UNLOCKED;
+bool callbackConnected = false;
+bool stopRequested = false;
+bool queueFailed = false;
+uint32_t callbackSession = 0;
+uint32_t callbackEpoch = 0;
+uint32_t controlSession = 0;
+uint32_t controlEpoch = 0;
 
 // ---------- Runtime state ----------
 enum class MotorDirection : uint8_t {
@@ -106,10 +141,13 @@ enum class HomeState : uint8_t {
 };
 
 MotorDirection motorDirection = MotorDirection::STOPPED;
+MotorDirection lastDriveDirection = MotorDirection::STOPPED;
+uint32_t lastDriveStoppedAtMs = 0;
 HomeState homeState = HomeState::IDLE;
 
 uint8_t speedPercent = DEFAULT_SPEED_PERCENT;
 uint32_t homeStateStartedAtMs = 0;
+piano::HomeReleaseGuard homeReleaseGuard;
 
 bool lowLimitStable = false;
 bool highLimitStable = false;
@@ -121,29 +159,18 @@ bool bothLimitFaultLatched = false;
 static const uint32_t LIMIT_DEBOUNCE_MS = 25;
 
 void abortHomeSequence(const char *reason);
+void abortAllMotion(const char *reason, bool report);
+void runRatchetMotion();
+
+bool isCurrentLink() {
+  portENTER_CRITICAL(&linkMux);
+  bool current = callbackConnected && !stopRequested && !queueFailed
+      && callbackSession == controlSession && callbackEpoch == controlEpoch;
+  portEXIT_CRITICAL(&linkMux);
+  return current;
+}
 
 // ---------- Utility ----------
-String bytesToHex(const uint8_t *data, size_t len) {
-  static const char *hex = "0123456789ABCDEF";
-  String out;
-  out.reserve(len * 2);
-  for (size_t i = 0; i < len; i++) {
-    out += hex[(data[i] >> 4) & 0x0F];
-    out += hex[data[i] & 0x0F];
-  }
-  return out;
-}
-
-String toUpperTrimmed(String value) {
-  value.trim();
-  value.toUpperCase();
-  return value;
-}
-
-bool startsWithHex(const String &hex, const char *prefix) {
-  return hex.startsWith(prefix);
-}
-
 uint8_t percentToDuty(uint8_t percent) {
   if (percent > 100) {
     percent = 100;
@@ -168,7 +195,7 @@ void pwmWriteIn2(uint8_t duty) {
 }
 
 void notifyBytes(const uint8_t *data, size_t len) {
-  if (!bleConnected || notifyCharacteristic == nullptr) {
+  if (!bleConnected || !isCurrentLink() || notifyCharacteristic == nullptr) {
     return;
   }
   notifyCharacteristic->setValue((uint8_t *)data, len);
@@ -176,7 +203,7 @@ void notifyBytes(const uint8_t *data, size_t len) {
 }
 
 void notifyText(const char *text) {
-  if (!bleConnected || notifyCharacteristic == nullptr) {
+  if (!bleConnected || !isCurrentLink() || notifyCharacteristic == nullptr) {
     return;
   }
   notifyCharacteristic->setValue((uint8_t *)text, strlen(text));
@@ -187,6 +214,16 @@ void notifyStatus(const char *text) {
   Serial.print("Status: ");
   Serial.println(text);
   notifyText(text);
+}
+
+void notifyTagged(const char *event, uint16_t id) {
+  char packet[21];
+  snprintf(packet, sizeof(packet), "%s:%u", event, (unsigned)id);
+  notifyStatus(packet);
+}
+
+void notifyHome(const char *event) {
+  notifyTagged(event, homeRequestId);
 }
 
 void notifyFault(const char *reason) {
@@ -211,6 +248,7 @@ void notifyLimit(bool lowSide, bool pressed) {
 void stopMotor(const char *reason = nullptr) {
   pwmWriteIn1(0);
   pwmWriteIn2(0);
+  if (motorDirection != MotorDirection::STOPPED) lastDriveStoppedAtMs = millis();
   motorDirection = MotorDirection::STOPPED;
 
   if (reason != nullptr) {
@@ -248,21 +286,27 @@ bool readHighLimitActive() {
 }
 
 bool moveLeftLow(const char *reason = nullptr) {
+  if (!pwmReady || !bleConnected || !isCurrentLink()) return false;
   if (lowLimitStable && highLimitStable) {
     stopMotor("both limits active");
     notifyFault("both limits active");
     return false;
   }
-  if (lowLimitStable) {
+  if (lowLimitStable || readLowLimitActive()) {
     stopMotor("left blocked by low limit");
     notifyLimit(true, true);
     notifyStatus("LIMIT_LOW_BLOCK");
     return false;
   }
 
+  if (motorDirection == MotorDirection::RIGHT_HIGH) { stopMotor("reversal interlock"); return false; }
+  if (lastDriveDirection == MotorDirection::RIGHT_HIGH
+      && millis() - lastDriveStoppedAtMs < piano::TimedMove::ReverseDelayMs) return false;
+
   uint8_t duty = percentToDuty(speedPercent);
   writeMotorLeftLow(duty);
   motorDirection = MotorDirection::LEFT_LOW;
+  lastDriveDirection = motorDirection;
 
   Serial.print("Motor LEFT/LOW");
   if (reason != nullptr) {
@@ -275,21 +319,27 @@ bool moveLeftLow(const char *reason = nullptr) {
 }
 
 bool moveRightHigh(const char *reason = nullptr) {
+  if (!pwmReady || !bleConnected || !isCurrentLink()) return false;
   if (lowLimitStable && highLimitStable) {
     stopMotor("both limits active");
     notifyFault("both limits active");
     return false;
   }
-  if (highLimitStable) {
+  if (highLimitStable || readHighLimitActive()) {
     stopMotor("right blocked by high limit");
     notifyLimit(false, true);
     notifyStatus("LIMIT_HIGH_BLOCK");
     return false;
   }
 
+  if (motorDirection == MotorDirection::LEFT_LOW) { stopMotor("reversal interlock"); return false; }
+  if (lastDriveDirection == MotorDirection::LEFT_LOW
+      && millis() - lastDriveStoppedAtMs < piano::TimedMove::ReverseDelayMs) return false;
+
   uint8_t duty = percentToDuty(speedPercent);
   writeMotorRightHigh(duty);
   motorDirection = MotorDirection::RIGHT_HIGH;
+  lastDriveDirection = motorDirection;
 
   Serial.print("Motor RIGHT/HIGH");
   if (reason != nullptr) {
@@ -302,8 +352,15 @@ bool moveRightHigh(const char *reason = nullptr) {
 }
 
 void startHomeSequence() {
+  stopMotor("new home request");
+  if (speedPercent == 0) {
+    abortHomeSequence("home speed is zero");
+    notifyFault("home speed is zero");
+    return;
+  }
   Serial.println("Home sequence start");
-  notifyStatus("HOME_START");
+  controllerHomed = false;
+  notifyHome("HOME_START");
 
   if (lowLimitStable && highLimitStable) {
     abortHomeSequence("both limits active at home start");
@@ -316,7 +373,7 @@ void startHomeSequence() {
     homeState = HomeState::BACKOFF_DELAY;
     homeStateStartedAtMs = millis();
     notifyLimit(true, true);
-    notifyStatus("HOME_LOW_LIMIT");
+    notifyHome("HOME_LOW_LIMIT");
     return;
   }
 
@@ -328,14 +385,20 @@ void startHomeSequence() {
 void finishHomeSequence() {
   homeState = HomeState::IDLE;
   stopMotor("home complete");
-  notifyStatus("HOME_DONE");
+  controllerHomed = true;
+  ratchetReturn.newTuningSession();
+  atRatchetLow = false;
+  notifyHome("HOME_DONE");
+  homeRequestId = 0;
   Serial.println("Home sequence complete");
 }
 
 void abortHomeSequence(const char *reason) {
   homeState = HomeState::IDLE;
   stopMotor(reason);
-  notifyStatus("HOME_ABORT");
+  controllerHomed = false;
+  notifyHome("HOME_ABORT");
+  homeRequestId = 0;
   Serial.print("Home aborted: ");
   Serial.println(reason);
 }
@@ -343,6 +406,7 @@ void abortHomeSequence(const char *reason) {
 void handleLimitSafety() {
   if (lowLimitStable && highLimitStable) {
     stopMotor("both limits active");
+    controllerHomed = false;
     if (homeState != HomeState::IDLE) {
       abortHomeSequence("both limits active");
     }
@@ -360,7 +424,7 @@ void handleLimitSafety() {
     if (homeState == HomeState::SEEK_LOW) {
       homeState = HomeState::BACKOFF_DELAY;
       homeStateStartedAtMs = millis();
-      notifyStatus("HOME_LOW_LIMIT");
+      notifyHome("HOME_LOW_LIMIT");
       Serial.println("Home low limit reached; preparing backoff");
     }
   }
@@ -400,6 +464,7 @@ void runHomeStateMachine() {
   if (homeState == HomeState::IDLE) {
     return;
   }
+  if (!isCurrentLink()) { abortAllMotion("stale HOME link", false); return; }
 
   uint32_t now = millis();
 
@@ -409,10 +474,10 @@ void runHomeStateMachine() {
         stopMotor("home low limit reached");
         homeState = HomeState::BACKOFF_DELAY;
         homeStateStartedAtMs = now;
-        notifyStatus("HOME_LOW_LIMIT");
+        notifyHome("HOME_LOW_LIMIT");
       } else if (now - homeStateStartedAtMs > HOME_SEEK_TIMEOUT_MS) {
-        notifyFault("home seek timeout");
         abortHomeSequence("home seek timeout");
+        notifyFault("home seek timeout");
       } else if (motorDirection != MotorDirection::LEFT_LOW) {
         moveLeftLow("home seek resume");
       }
@@ -422,17 +487,26 @@ void runHomeStateMachine() {
       if (now - homeStateStartedAtMs >= HOME_BACKOFF_START_DELAY_MS) {
         homeState = HomeState::BACKOFF_RIGHT;
         homeStateStartedAtMs = now;
-        notifyStatus("HOME_BACKOFF");
+        homeReleaseGuard.begin(now);
+        notifyHome("HOME_BACKOFF");
         moveRightHigh("home backoff 10 rev");
       }
       break;
 
     case HomeState::BACKOFF_RIGHT:
       if (highLimitStable) {
-        notifyFault("high limit during home backoff");
         abortHomeSequence("high limit during home backoff");
+        notifyFault("high limit during home backoff");
+      } else if (!homeReleaseGuard.update(now, lowLimitStable)) {
+        stopMotor("origin limit stuck or reactivated");
+        notifyHome("HOME_LOW_STUCK");
+        abortHomeSequence("origin limit stuck or reactivated");
       } else if (now - homeStateStartedAtMs >= HOME_BACKOFF_MS) {
-        finishHomeSequence();
+        if (homeReleaseGuard.released() && !lowLimitStable) {
+          finishHomeSequence();
+        } else {
+          abortHomeSequence("origin limit release not confirmed");
+        }
       } else if (motorDirection != MotorDirection::RIGHT_HIGH) {
         moveRightHigh("home backoff resume");
       }
@@ -460,145 +534,308 @@ void setSpeedPercent(uint8_t percent) {
   }
 }
 
-void handleHexCommand(const String &hex) {
-  Serial.print("BLE hex command: ");
-  Serial.println(hex);
-
-  if (startsWithHex(hex, "AF010203040506FF")) {
-    notifyText("READY");
-    return;
-  }
-
-  if (startsWithHex(hex, "A10801") && hex.length() >= 8) {
-    String speedHex = hex.substring(6, 8);
-    uint8_t speed = (uint8_t)strtoul(speedHex.c_str(), nullptr, 16);
-    setSpeedPercent(speed);
-    return;
-  }
-
-  if (startsWithHex(hex, "A1F001")) {
-    startHomeSequence();
-    return;
-  }
-
-  if (startsWithHex(hex, "A10102") || startsWithHex(hex, "A10202")) {
-    homeState = HomeState::IDLE;
-    stopMotor("BLE stop");
-    return;
-  }
-
-  if (startsWithHex(hex, "A10101")) {
-    homeState = HomeState::IDLE;
-    moveLeftLow("BLE left");
-    return;
-  }
-
-  if (startsWithHex(hex, "A10201")) {
-    homeState = HomeState::IDLE;
-    moveRightHigh("BLE right");
-    return;
-  }
-
-  Serial.println("Unknown hex command ignored");
-}
-
-void handleTextCommand(String command) {
-  command = toUpperTrimmed(command);
-  if (command.length() == 0) {
-    return;
-  }
-
-  Serial.print("BLE text command: ");
-  Serial.println(command);
-
-  if (command == "LEFT") {
-    homeState = HomeState::IDLE;
-    moveLeftLow("text left");
-  } else if (command == "RIGHT") {
-    homeState = HomeState::IDLE;
-    moveRightHigh("text right");
-  } else if (command == "STOP") {
-    homeState = HomeState::IDLE;
-    stopMotor("text stop");
-  } else if (command == "HOME" || command == "INIT") {
-    startHomeSequence();
-  } else if (command.startsWith("SPEED ")) {
-    int value = command.substring(6).toInt();
-    if (value < 0) {
-      value = 0;
-    }
-    if (value > 100) {
-      value = 100;
-    }
-    setSpeedPercent((uint8_t)value);
+void reportTimedResult() {
+  if (timedResultReported || timedMove.active()) return;
+  stopMotor("timed move terminal");
+  timedResultReported = true;
+  const char *event = "MOVE_ABORT";
+  if (timedMove.result() == piano::MoveResult::Done && !timedOriginReleaseFault) {
+    event = "MOVE_DONE";
   } else {
-    Serial.println("Unknown text command ignored");
+    controllerHomed = false;
+    if (timedMove.result() == piano::MoveResult::Limit) event = "MOVE_LIMIT";
+    if (timedMove.result() == piano::MoveResult::HighLimit) {
+      event = ratchetReturn.armAtHigh() ? "MOVE_HIGH" : "MOVE_LIMIT";
+    }
+  }
+  atRatchetLow = false;
+  notifyTagged(event, timedMove.id());
+}
+
+void abortAllMotion(const char *reason, bool report) {
+  stopMotor(reason);  // always remove drive before serial/BLE reporting
+  controllerHomed = false;
+  manualHold.stop();
+  timedMove.cancel();
+  ratchetReturn.cancel();
+  atRatchetLow = false;
+  if (report) reportTimedResult();
+  else timedResultReported = true;
+  if (report) runRatchetMotion();
+  else ratchetResultReported = true;
+  if (homeState != HomeState::IDLE) {
+    if (report) abortHomeSequence(reason);
+    else { homeState = HomeState::IDLE; homeRequestId = 0; }
   }
 }
 
-bool looksLikePrintableText(const std::string &value) {
-  if (value.empty()) {
-    return false;
+void runTimedMotion() {
+  if (!timedMove.active()) return;
+  if (atRatchetLow && !ratchetLowRelease.update(millis(), lowLimitStable)) {
+    timedOriginReleaseFault = true;
+    timedMove.cancel();
   }
-
-  for (char ch : value) {
-    uint8_t c = (uint8_t)ch;
-    if (c == '\r' || c == '\n' || c == '\t') {
-      continue;
-    }
-    if (c < 0x20 || c > 0x7E) {
-      return false;
-    }
+  // Raw activation inhibits drive immediately; stable edges are used for HOME.
+  timedMove.tick(millis(), lowLimitStable || readLowLimitActive(),
+                 highLimitStable || readHighLimitActive(), bleConnected && isCurrentLink());
+  if (atRatchetLow && timedMove.result() == piano::MoveResult::Done && !ratchetLowRelease.released()) {
+    timedOriginReleaseFault = true;
   }
+  piano::Direction output = timedMove.output();
+  if (output == piano::Direction::Stop) {
+    stopMotor();
+  } else if (output == piano::Direction::Low && motorDirection != MotorDirection::LEFT_LOW) {
+    if (!moveLeftLow("local timed move")) timedMove.cancel(piano::MoveResult::Limit);
+  } else if (output == piano::Direction::High && motorDirection != MotorDirection::RIGHT_HIGH) {
+    if (!moveRightHigh("local timed move")) timedMove.cancel(piano::MoveResult::Limit);
+  }
+  reportTimedResult();
+}
 
-  return true;
+void runRatchetMotion() {
+  if (ratchetResultReported) return;
+  if (ratchetReturn.active()) {
+    ratchetReturn.tick(millis(), lowLimitStable, highLimitStable, bleConnected && isCurrentLink());
+    if (ratchetReturn.output() == piano::Direction::Low && !readLowLimitActive()) {
+      if (motorDirection != MotorDirection::LEFT_LOW) moveLeftLow("ratchet freewheel return");
+    } else stopMotor();
+  }
+  if (!ratchetReturn.active()) {
+    stopMotor("ratchet return terminal");
+    ratchetResultReported = true;
+    bool done = ratchetReturn.result() == piano::RatchetResult::Done;
+    controllerHomed = done;
+    atRatchetLow = done;
+    notifyTagged(done ? "RATCH_DONE" : "RATCH_ABORT", ratchetReturn.id());
+  }
+}
+
+void runManualMotion() {
+  if (!isCurrentLink()) { abortAllMotion("stale manual link", false); return; }
+  piano::Direction before = manualHold.output();
+  manualHold.tick(millis());
+  piano::Direction output = manualHold.output();
+  if (output == piano::Direction::Stop) {
+    if (before != piano::Direction::Stop) {
+      stopMotor("manual lease expired");
+      controllerHomed = false;
+      notifyStatus("HOLD_TIMEOUT");
+    }
+    return;
+  }
+  bool blocked = (output == piano::Direction::Low && (lowLimitStable || readLowLimitActive()))
+      || (output == piano::Direction::High && (highLimitStable || readHighLimitActive()));
+  if (blocked) {
+    stopMotor("manual limit");
+    manualHold.stop();
+    controllerHomed = false;
+    notifyStatus("HOLD_LIMIT");
+    return;
+  }
+  if (output == piano::Direction::Low && motorDirection != MotorDirection::LEFT_LOW) moveLeftLow("manual hold");
+  if (output == piano::Direction::High && motorDirection != MotorDirection::RIGHT_HIGH) moveRightHigh("manual hold");
+}
+
+bool motionBusy() {
+  return timedMove.active() || ratchetReturn.active() || homeState != HomeState::IDLE
+      || manualHold.output() != piano::Direction::Stop;
+}
+
+void dispatchCommand(const QueuedCommand &packet) {
+  piano::Command command = piano::decodeCommand(packet.data, packet.size);
+  if (command.type == piano::CommandType::Capabilities) {
+    notifyStatus("SAFE_V2");
+    notifyLimit(true, lowLimitStable);
+    notifyLimit(false, highLimitStable);
+    return;
+  }
+  if (command.type == piano::CommandType::Ready) { notifyStatus("READY"); return; }
+  if (command.type == piano::CommandType::Invalid) {
+    abortAllMotion("invalid command", true);
+    notifyStatus("ERR_FRAME");
+    return;
+  }
+  if (command.type == piano::CommandType::Stop) {
+    if (motionBusy()) abortAllMotion("STOP", true);
+    else { stopMotor("STOP idle"); manualHold.stop(); ratchetReturn.cancel(); }
+    return;
+  }
+  if (!pwmReady || !bleConnected || !isCurrentLink()) { notifyTagged("ERR_OUTPUT", command.id); return; }
+  if (millis() - packet.queuedAtMs > 250) {
+    abortAllMotion("expired queued command", true);
+    notifyTagged("ERR_EXPIRED", command.id);
+    return;
+  }
+  if (command.type == piano::CommandType::Speed) {
+    if (motionBusy()) { notifyTagged("ERR_BUSY", command.id); return; }
+    setSpeedPercent(command.speed);
+    return;
+  }
+  if (speedPercent == 0) { notifyTagged("ERR_SPEED", command.id); return; }
+  if (command.type == piano::CommandType::Hold) {
+    if (timedMove.active() || ratchetReturn.active() || homeState != HomeState::IDLE) {
+      notifyTagged("ERR_BUSY", 0);
+      return;
+    }
+    controllerHomed = false;
+    ratchetReturn.cancel();
+    atRatchetLow = false;
+    if (!manualHold.refresh(command.direction, millis())) {
+      stopMotor("hold rejected");
+      notifyStatus("ERR_HOLD");
+      return;
+    }
+    runManualMotion();
+    return;
+  }
+  if (!requestIds.isFresh(command.id)) { notifyTagged("ERR_STALE", command.id); return; }
+  if (motionBusy()) { notifyTagged("ERR_BUSY", command.id); return; }
+  if (manualHold.expired()) { notifyTagged("ERR_HOLD", command.id); return; }
+  if (command.type == piano::CommandType::Home) {
+    requestIds.accept(command.id);
+    ratchetReturn.cancel();
+    atRatchetLow = false;
+    homeRequestId = command.id;
+    startHomeSequence();
+    return;
+  }
+  if (command.type == piano::CommandType::Ratchet) {
+    if (!ratchetReturn.start(command.id, lowLimitStable || readLowLimitActive(),
+        highLimitStable || readHighLimitActive(), bleConnected, millis())) {
+      notifyTagged("ERR_RATCH", command.id);
+      return;
+    }
+    requestIds.accept(command.id);
+    controllerHomed = false;
+    atRatchetLow = false;
+    ratchetResultReported = false;
+    notifyTagged("RATCH_START", command.id);
+    runRatchetMotion();
+    return;
+  }
+  if (!controllerHomed) { notifyTagged("ERR_HOME", command.id); return; }
+  if (atRatchetLow && (command.direction != piano::Direction::High || command.preloadMs != 0)) {
+    notifyTagged("ERR_RATCH", command.id);
+    return;
+  }
+  piano::StartResult accepted = timedMove.start(command.id, command.direction,
+      command.runMs, command.preloadMs, millis());
+  if (accepted != piano::StartResult::Accepted) { notifyTagged("ERR_MOVE", command.id); return; }
+  requestIds.accept(command.id);
+  timedOriginReleaseFault = false;
+  if (atRatchetLow) ratchetLowRelease.begin(millis());
+  timedResultReported = false;
+  // Validate limits before enabling the first output. START is not completion.
+  timedMove.tick(millis(), lowLimitStable || readLowLimitActive(),
+      highLimitStable || readHighLimitActive(), bleConnected);
+  if (timedMove.active()) notifyTagged("MOVE_START", command.id);
+  runTimedMotion();
+  reportTimedResult();
+}
+
+void serviceLinkAndCommands() {
+  bool connected, stop, failed;
+  uint32_t session, epoch;
+  portENTER_CRITICAL(&linkMux);
+  connected = callbackConnected;
+  stop = stopRequested;
+  failed = queueFailed;
+  session = callbackSession;
+  epoch = callbackEpoch;
+  stopRequested = false;
+  queueFailed = false;
+  portEXIT_CRITICAL(&linkMux);
+
+  bool newSession = session != controlSession;
+  if (newSession || stop || failed) {
+    if (newSession || failed || motionBusy()) abortAllMotion("link/STOP barrier", !newSession && connected);
+    else { stopMotor("idle STOP barrier"); manualHold.stop(); ratchetReturn.cancel(); }
+  }
+  bleConnected = connected;
+  controlSession = session;
+  controlEpoch = epoch;
+  if (newSession) {
+    requestIds.newSession();
+    timedMove.newSession();
+    ratchetReturn.newTuningSession();
+    atRatchetLow = false;
+    if (!connected) BLEDevice::startAdvertising();
+  }
+  if (failed && connected) notifyStatus("ERR_QUEUE");
+
+  QueuedCommand packet;
+  for (int count = 0; count < 4 && xQueueReceive(commandQueue, &packet, 0) == pdTRUE; ++count) {
+    bool current;
+    portENTER_CRITICAL(&linkMux);
+    current = callbackConnected && !stopRequested && !queueFailed
+        && packet.session == callbackSession && packet.epoch == callbackEpoch;
+    portEXIT_CRITICAL(&linkMux);
+    if (current && packet.session == controlSession && packet.epoch == controlEpoch) dispatchCommand(packet);
+  }
 }
 
 class MotorWriteCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
-    std::string value = characteristic->getValue();
-    if (value.empty()) {
+    auto value = characteristic->getValue(); // Arduino-ESP32 2.x std::string / 3.x String
+    size_t length = value.length();
+    const uint8_t *data = (const uint8_t *)value.c_str();
+    bool stop = piano::decodeCommand(data, length <= 20 ? (uint8_t)length : 0).type == piano::CommandType::Stop
+        || (length == 4 && memcmp(data, "STOP", 4) == 0);
+    QueuedCommand packet = {};
+    portENTER_CRITICAL(&linkMux);
+    if (!callbackConnected) { portEXIT_CRITICAL(&linkMux); return; }
+    if (stop || length == 0 || length > sizeof(packet.data)) {
+      ++callbackEpoch;
+      stopRequested = true;
+      if (!stop) queueFailed = true;
+      portEXIT_CRITICAL(&linkMux);
       return;
     }
-
-    const uint8_t *data = (const uint8_t *)value.data();
-    String hex = bytesToHex(data, value.length());
-
-    if (looksLikePrintableText(value)) {
-      String text;
-      text.reserve(value.length());
-      for (char ch : value) {
-        text += ch;
-      }
-      handleTextCommand(text);
-    } else {
-      handleHexCommand(hex);
+    packet.session = callbackSession;
+    packet.epoch = callbackEpoch;
+    portEXIT_CRITICAL(&linkMux);
+    packet.size = (uint8_t)length;
+    packet.queuedAtMs = millis();
+    memcpy(packet.data, data, length);
+    if (xQueueSend(commandQueue, &packet, 0) != pdTRUE) {
+      portENTER_CRITICAL(&linkMux);
+      ++callbackEpoch;
+      queueFailed = true;
+      stopRequested = true;
+      portEXIT_CRITICAL(&linkMux);
     }
   }
 };
 
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
-    bleConnected = true;
-    Serial.println("BLE connected");
+    portENTER_CRITICAL(&linkMux);
+    callbackConnected = true;
+    ++callbackSession;
+    ++callbackEpoch;
+    stopRequested = true;
+    portEXIT_CRITICAL(&linkMux);
   }
 
   void onDisconnect(BLEServer *server) override {
-    bleConnected = false;
-    homeState = HomeState::IDLE;
-    stopMotor("BLE disconnected");
-    Serial.println("BLE disconnected, advertising again");
-    BLEDevice::startAdvertising();
+    portENTER_CRITICAL(&linkMux);
+    callbackConnected = false;
+    ++callbackSession;
+    ++callbackEpoch;
+    stopRequested = true;
+    portEXIT_CRITICAL(&linkMux);
   }
 };
 
 void setupPwm() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcAttach(PIN_MOTOR_IN1, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
-  ledcAttach(PIN_MOTOR_IN2, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  bool in1Ready = ledcAttach(PIN_MOTOR_IN1, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  bool in2Ready = ledcAttach(PIN_MOTOR_IN2, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  pwmReady = in1Ready && in2Ready;
 #else
-  ledcSetup(PWM_CHANNEL_IN1, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
-  ledcSetup(PWM_CHANNEL_IN2, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  double in1Frequency = ledcSetup(PWM_CHANNEL_IN1, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  double in2Frequency = ledcSetup(PWM_CHANNEL_IN2, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  pwmReady = in1Frequency > 0 && in2Frequency > 0;
   ledcAttachPin(PIN_MOTOR_IN1, PWM_CHANNEL_IN1);
   ledcAttachPin(PIN_MOTOR_IN2, PWM_CHANNEL_IN2);
 #endif
@@ -656,6 +893,12 @@ void setup() {
   highLimitRawChangedAtMs = millis();
 
   setupPwm();
+  commandQueue = xQueueCreate(8, sizeof(QueuedCommand));
+  if (commandQueue == nullptr || !pwmReady) {
+    stopMotor("controller setup failed");
+    Serial.println("Controller unavailable: queue/PWM setup failed");
+    while (true) delay(1000); // never advertise an unusable motor controller
+  }
   setupBle();
 
   Serial.print("Initial low limit: ");
@@ -665,7 +908,11 @@ void setup() {
 }
 
 void loop() {
+  serviceLinkAndCommands();
   pollLimits();
   runHomeStateMachine();
+  runTimedMotion();
+  runRatchetMotion();
+  runManualMotion();
   delay(5);
 }

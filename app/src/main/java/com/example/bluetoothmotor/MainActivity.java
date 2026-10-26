@@ -39,6 +39,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.text.InputFilter;
@@ -58,6 +59,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -128,13 +130,33 @@ public class MainActivity extends Activity {
     private static final String CMD_LEFT = "A1010100000002321F";
     private static final String CMD_STOP = "A10102000000011F";
     private static final String CMD_RIGHT = "A1020100000002321F";
-    private static final String CMD_HOME = "A1F001";
     private static final String CMD_SPEED_50 = "A1080132";
     private static final String CMD_SPEED_30 = "A108011E";
     private static final String CMD_SPEED_STEP = CMD_SPEED_50;
     private static final String PREFS_NAME = "max_piano_tuner";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final SafeMotorSession safeMotor = new SafeMotorSession();
+    private final PianoStrikeGate motorStrikeGate = new PianoStrikeGate();
+    private final ArrayDeque<MotorWrite> motorWrites = new ArrayDeque<>();
+    private MotorWrite activeMotorWrite;
+    private long motorWriteTicket;
+    private boolean activityPaused;
+
+    private static final class MotorWrite {
+        final String label;
+        final byte[] payload;
+        final int generation;
+        final BluetoothGatt owner;
+        final boolean stop;
+        MotorWrite(String label, byte[] payload, int generation, BluetoothGatt owner, boolean stop) {
+            this.label = label;
+            this.payload = payload;
+            this.generation = generation;
+            this.owner = owner;
+            this.stop = stop;
+        }
+    }
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override
         public void run() {
@@ -185,6 +207,7 @@ public class MainActivity extends Activity {
     private AudioRecord audioRecord;
     private Thread audioThread;
     private volatile boolean listening;
+    private volatile int audioGeneration;
     private volatile double latestFrequency;
     private volatile int latestMidi;
     private volatile double latestCents;
@@ -303,115 +326,98 @@ public class MainActivity extends Activity {
     private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         @Override
-        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                appendLogSafe("蓝牙已连接，正在发现服务");
-                runOnUiThread(() -> showMotorDialog("正在发现电机服务..."));
-                runOnUiThread(() -> setStatus("蓝牙已连接，正在发现服务"));
-                gatt.discoverServices();
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                if (MainActivity.this.gatt == gatt) {
+        public void onConnectionStateChange(BluetoothGatt owner, int status, int newState) {
+            runOnUiThread(() -> {
+                if (MainActivity.this.gatt != owner) {
+                    if (newState == BluetoothProfile.STATE_DISCONNECTED) owner.close();
+                    return;
+                }
+                if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS && !activityPaused) {
+                    setStatus("蓝牙已连接，正在发现服务");
+                    showMotorDialog("正在发现电机服务...");
+                    if (!owner.discoverServices()) motorTransportFailure("Service discovery rejected");
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    owner.close();
                     MainActivity.this.gatt = null;
                     writeCharacteristic = null;
-                }
-                gatt.close();
-                appendLogSafe("蓝牙已断开，status=" + status);
-                runOnUiThread(() -> stopHeartbeat());
-                runOnUiThread(() -> dismissMotorDialog());
-                runOnUiThread(() -> setStatus("蓝牙已断开"));
-                if (reconnectAfterDisconnect) {
-                    reconnectAfterDisconnect = false;
-                    handler.postDelayed(() -> openGattConnection("正在重新连接 "), 650L);
-                }
-            }
-        }
-
-        @Override
-        public void onServicesDiscovered(BluetoothGatt gatt, int status) {
-            BluetoothGattCharacteristic write = null;
-            BluetoothGattCharacteristic notify = null;
-            for (BluetoothGattService service : gatt.getServices()) {
-                for (BluetoothGattCharacteristic characteristic : service.getCharacteristics()) {
-                    if (WRITE_UUID.equals(characteristic.getUuid())) {
-                        write = characteristic;
-                    }
-                    if (NOTIFY_UUID.equals(characteristic.getUuid())) {
-                        notify = characteristic;
-                    }
-                }
-            }
-
-            writeCharacteristic = write;
-            BluetoothGattCharacteristic notifyCharacteristic = notify;
-            runOnUiThread(() -> {
-                if (writeCharacteristic == null) {
+                    motorWrites.clear();
+                    activeMotorWrite = null;
+                    motorWriteTicket++;
+                    cancelScheduledCommands();
+                    stopAutoTune(false);
+                    clearMotorPosition();
+                    safeMotor.disconnected();
+                    stopHeartbeat();
                     dismissMotorDialog();
-                    setStatus("已连接，但未找到 FFE2 写入通道");
-                } else {
-                    setStatus("蓝牙就绪：已选择 FFE2 写入通道");
+                    pendingFreshHex = null;
+                    pendingReplayVendorLr = false;
+                    reconnectAfterDisconnect = false;
+                    setStatus("蓝牙已断开；重新连接后需要重新初始化");
+                } else if (status != BluetoothGatt.GATT_SUCCESS || activityPaused) {
+                    motorTransportFailure("Bluetooth connection failed: " + status);
                 }
             });
-
-            if (notifyCharacteristic != null) {
-                enableNotifications(gatt, notifyCharacteristic);
-            } else {
-                appendLogSafe("未找到 FFE1 通知通道");
-            }
         }
 
         @Override
-        public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
-            appendLogSafe("CCCD write status=" + status);
-            if (status == BluetoothGatt.GATT_SUCCESS && CCCD_UUID.equals(descriptor.getUuid())) {
-                sendCommandFromGattCallback("INIT", CMD_INIT);
-                scheduleCommand("AUTO SPEED" + autoSpeedPercent, speedCommandForPercent(autoSpeedPercent), 180L);
-                runOnUiThread(() -> startHeartbeat());
-                runOnUiThread(() -> dismissMotorDialog());
-                runOnUiThread(() -> setStatus("蓝牙已连接：电机初始化命令已发送"));
-                if (pendingFreshHex != null) {
-                    String label = pendingFreshLabel;
-                    String hex = pendingFreshHex;
-                    long motionDelayMs = pendingFreshMotionDelayMs;
-                    int repeatCount = pendingFreshRepeatCount;
-                    long repeatIntervalMs = pendingFreshRepeatIntervalMs;
-                    int speedCount = pendingFreshSpeedCount;
-                    long speedStartMs = pendingFreshSpeedStartMs;
-                    long speedIntervalMs = pendingFreshSpeedIntervalMs;
-                    long stopExtraMs = pendingFreshStopExtraMs;
-                    pendingFreshLabel = null;
-                    pendingFreshHex = null;
-                    pendingFreshMotionDelayMs = 0L;
-                    pendingFreshRepeatCount = 1;
-                    pendingFreshRepeatIntervalMs = 0L;
-                    pendingFreshSpeedCount = 0;
-                    pendingFreshSpeedStartMs = 0L;
-                    pendingFreshSpeedIntervalMs = 0L;
-                    pendingFreshStopExtraMs = 50L;
-                    for (int i = 0; i < speedCount; i++) {
-                        scheduleCommand(label + " SPEED " + (i + 1) + "/" + speedCount,
-                                CMD_SPEED_STEP,
-                                speedStartMs + i * speedIntervalMs);
-                    }
-                    for (int i = 0; i < repeatCount; i++) {
-                        scheduleCommand(label + " FRESH " + (i + 1) + "/" + repeatCount,
-                                hex,
-                                motionDelayMs + i * repeatIntervalMs);
-                    }
-                    scheduleCommand(label + " FRESH STOP",
-                            CMD_STOP,
-                            motionDelayMs + repeatCount * repeatIntervalMs + stopExtraMs);
+        public void onServicesDiscovered(BluetoothGatt owner, int status) {
+            runOnUiThread(() -> {
+                if (owner != MainActivity.this.gatt || activityPaused) return;
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    motorTransportFailure("Service discovery failed: " + status);
+                    return;
                 }
-                replayVendorLrAfterInitAck = pendingReplayVendorLr;
-            }
+                BluetoothGattCharacteristic write = null;
+                BluetoothGattCharacteristic notify = null;
+                for (BluetoothGattService service : owner.getServices()) {
+                    for (BluetoothGattCharacteristic c : service.getCharacteristics()) {
+                        if (WRITE_UUID.equals(c.getUuid())) write = c;
+                        if (NOTIFY_UUID.equals(c.getUuid())) notify = c;
+                    }
+                }
+                if (write == null || notify == null
+                        || (write.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE) == 0) {
+                    motorTransportFailure("Safe controller requires FFE2 write-with-response and FFE1 notifications");
+                    return;
+                }
+                writeCharacteristic = write;
+                enableNotifications(owner, notify);
+            });
         }
 
         @Override
-        public void onCharacteristicWrite(
-                BluetoothGatt gatt,
-                BluetoothGattCharacteristic characteristic,
-                int status
-        ) {
-            appendLogSafe("Write done status=" + status);
+        public void onDescriptorWrite(BluetoothGatt owner, BluetoothGattDescriptor descriptor, int status) {
+            runOnUiThread(() -> {
+                if (owner != MainActivity.this.gatt || activityPaused) return;
+                if (status != BluetoothGatt.GATT_SUCCESS || !CCCD_UUID.equals(descriptor.getUuid())) {
+                    motorTransportFailure("Notification subscription failed: " + status);
+                    return;
+                }
+                sendCommand("SAFE CAPABILITIES", SafeMotorSession.CAPABILITIES_HEX);
+                startHeartbeat();
+                dismissMotorDialog();
+                setStatus("正在确认安全协议；未确认前禁止电机运动");
+                handler.postDelayed(() -> {
+                    if (owner == MainActivity.this.gatt && !safeMotor.capable() && !activityPaused) {
+                        setStatus("未检测到安全协议，请升级 ESP32 固件；自动/手动电机控制已禁用");
+                    }
+                }, 2500L);
+            });
+        }
+
+        @Override
+        public void onCharacteristicWrite(BluetoothGatt owner, BluetoothGattCharacteristic characteristic, int status) {
+            runOnUiThread(() -> {
+                if (owner != MainActivity.this.gatt || activeMotorWrite == null
+                        || activeMotorWrite.owner != owner) return;
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    motorTransportFailure("BLE write failed: " + status);
+                    return;
+                }
+                activeMotorWrite = null;
+                motorWriteTicket++;
+                pumpMotorWrites();
+            });
         }
 
         @Override
@@ -419,7 +425,7 @@ public class MainActivity extends Activity {
                 BluetoothGatt gatt,
                 BluetoothGattCharacteristic characteristic
         ) {
-            handleNotifyValue(characteristic, characteristic.getValue());
+            handleNotifyValue(gatt, characteristic, characteristic.getValue());
         }
 
         @Override
@@ -428,7 +434,7 @@ public class MainActivity extends Activity {
                 BluetoothGattCharacteristic characteristic,
                 byte[] value
         ) {
-            handleNotifyValue(characteristic, value);
+            handleNotifyValue(gatt, characteristic, value);
         }
 
     };
@@ -463,6 +469,31 @@ public class MainActivity extends Activity {
             pianoKeyPlayer = null;
         }
         super.onDestroy();
+    }
+
+    @Override
+    protected void onPause() {
+        activityPaused = true;
+        stopPitchListening();
+        cancelScheduledCommands();
+        stopAutoTune(false);
+        clearMotorPosition();
+        motorWrites.clear();
+        pendingFreshHex = null;
+        pendingReplayVendorLr = false;
+        reconnectAfterDisconnect = false;
+        if (gatt != null) {
+            sendCommand("BACKGROUND STOP", CMD_STOP);
+            disconnectGatt();
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        activityPaused = false;
+        if (hasAudioPermission() && tunerView != null) startPitchListening();
     }
 
     private View buildContentView() {
@@ -1193,16 +1224,14 @@ public class MainActivity extends Activity {
         logText.append(line);
     }
 
-    private void handleNotifyValue(BluetoothGattCharacteristic characteristic, byte[] value) {
-        String hex = toHex(value);
-        handleEsp32StatusNotification(value);
-        if (isInitAck(value) && replayVendorLrAfterInitAck) {
-            replayVendorLrAfterInitAck = false;
-            pendingReplayVendorLr = false;
-            scheduleVendorLrReplay(5675L);
-        }
-        handleLimitNotification(value);
+    private void handleNotifyValue(BluetoothGatt owner, BluetoothGattCharacteristic characteristic, byte[] value) {
+        if (value == null) return;
+        byte[] snapshot = value.clone();
         runOnUiThread(() -> {
+            if (owner != gatt || activityPaused) return;
+            handleEsp32StatusNotification(snapshot);
+            handleLimitNotification(snapshot);
+            String hex = toHex(snapshot);
             notifyText.setText("Notify: " + hex);
             appendLog("Notify " + characteristic.getUuid() + " = " + hex);
         });
@@ -1210,48 +1239,64 @@ public class MainActivity extends Activity {
 
     private void handleEsp32StatusNotification(byte[] value) {
         String text = printableAscii(value);
-        if (text == null) {
-            return;
-        }
+        if (text == null) return;
         String clean = text.trim().toUpperCase(Locale.US);
-        if (clean.length() == 0) {
-            return;
-        }
-        if ("HOME_START".equals(clean)) {
-            runOnUiThread(() -> {
-                setStatus("ESP32: 初始化开始，正在寻找低音侧限位");
-                if (autoText != null) {
-                    autoText.setText("Init: ESP32 seeking low limit");
-                }
-            });
-        } else if ("HOME_LOW_LIMIT".equals(clean)) {
-            runOnUiThread(() -> {
-                setStatus("ESP32: 已碰到低音侧限位，准备回退");
-                if (autoText != null) {
-                    autoText.setText("Init: low limit found, backing off");
-                }
-            });
-        } else if ("HOME_BACKOFF".equals(clean)) {
-            runOnUiThread(() -> {
-                setStatus("ESP32: 正在反向回退 10 圈");
-                if (autoText != null) {
-                    autoText.setText("Init: backing off 10 rev");
-                }
-            });
-        } else if ("HOME_DONE".equals(clean)) {
-            runOnUiThread(this::finishMotorSafetyInitializationFromEsp32);
-        } else if (clean.startsWith("HOME_ABORT")
-                || clean.startsWith("FAULT")
-                || clean.startsWith("ERR")) {
-            motorSafetyInitInProgress = false;
-            motorSafetyBackoffInProgress = false;
-            triggerSafetyVibration("ESP32 motor fault");
-            runOnUiThread(() -> {
-                setStatus("ESP32: 初始化失败/电机保护触发");
-                if (autoText != null) {
-                    autoText.setText("Init: ESP32 fault - " + clean);
-                }
-            });
+        SafeMotorSession.Request request = safeMotor.pending();
+        SafeMotorSession.Event event = safeMotor.status(clean, SystemClock.elapsedRealtime());
+        if (event == SafeMotorSession.Event.FAULT) {
+            failMotorSafety("ESP32 protection/invalid acknowledgement: " + clean, true);
+        } else if (event == SafeMotorSession.Event.CAPABLE) {
+            setStatus(safeMotor.supportsRatchet() ? "SAFE_V2 已确认（棘轮续调）；取下扳手后初始化" : "SAFE_V1 基础定时模式已确认；取下扳手后初始化");
+        } else if (event == SafeMotorSession.Event.HOME_DONE) {
+            finishMotorSafetyInitializationFromEsp32();
+        } else if (event == SafeMotorSession.Event.HIGH_LIMIT) {
+            motorSafetyInitialized = false;
+            motorPositionRevFromLow = Double.NaN;
+            currentDirection = Direction.NONE;
+            autoLastDirection = Direction.NONE;
+            latestStablePitchMs = 0;
+            pitchCandidateFrames = 0;
+            autoIgnorePitchBeforeMs = System.currentTimeMillis() + EXPERIENCE_RESTRIKE_ARM_MS;
+            autoWaitingForRestrike = true;
+            armMotorStrike(EXPERIENCE_RESTRIKE_ARM_MS);
+            autoText.setText("High limit: strike the selected key to confirm remaining flat pitch");
+            scheduleAuto(this::autoAdjustLoop, autoSettleMs);
+        } else if (event == SafeMotorSession.Event.RATCHET_DONE) {
+            motorPositionRevFromLow = 0.0;
+            motorSafetyInitialized = true;
+            motorSafetyInitializedMidi = autoTargetMidi;
+            currentDirection = Direction.NONE;
+            autoLastDirection = Direction.NONE;
+            latestStablePitchMs = 0;
+            pitchCandidateFrames = 0;
+            autoIgnorePitchBeforeMs = System.currentTimeMillis() + EXPERIENCE_RESTRIKE_ARM_MS;
+            autoWaitingForRestrike = true;
+            armMotorStrike(EXPERIENCE_RESTRIKE_ARM_MS);
+            autoText.setText("Ratchet return complete: strike the key before the next raising stroke");
+            scheduleAuto(this::autoAdjustLoop, autoSettleMs);
+        } else if (event == SafeMotorSession.Event.MOVE_DONE && request != null) {
+            if (Double.isNaN(motorPositionRevFromLow)) {
+                failMotorSafety("Completed move without a known home position", true);
+                return;
+            }
+            Direction direction = request.direction == 1 ? Direction.LEFT : Direction.RIGHT;
+            if (request.preloadMs > 0) {
+                updateMotorPositionAfterMove(direction == Direction.LEFT ? Direction.RIGHT : Direction.LEFT, request.preloadMs);
+            }
+            updateMotorPositionAfterMove(direction, request.runMs);
+            currentDirection = Direction.NONE;
+            if (autoTuning) {
+                autoWaitingForRestrike = true;
+                latestStablePitchMs = 0;
+                pitchCandidateFrames = 0;
+                autoIgnorePitchBeforeMs = System.currentTimeMillis() + EXPERIENCE_RESTRIKE_ARM_MS;
+                armMotorStrike(EXPERIENCE_RESTRIKE_ARM_MS);
+                autoText.setText("Auto: controller stopped; play the physical key again");
+                scheduleAuto(this::autoAdjustLoop, autoSettleMs);
+            }
+        } else if (event == SafeMotorSession.Event.STARTED || event == SafeMotorSession.Event.PROGRESS) {
+            autoText.setText("ESP32: " + clean);
+            setStatus("ESP32: " + clean);
         }
     }
 
@@ -1340,6 +1385,7 @@ public class MainActivity extends Activity {
 
     @SuppressLint("MissingPermission")
     private void openGattConnection(String prefix) {
+        if (activityPaused) return;
         if (!hasConnectPermission()) {
             requestNeededPermissions();
             return;
@@ -1350,6 +1396,11 @@ public class MainActivity extends Activity {
         }
         setStatus(prefix + "蓝牙电机板");
         appendLog(prefix + deviceLabel(targetDevice));
+        clearMotorPosition();
+        safeMotor.connected();
+        motorWrites.clear();
+        activeMotorWrite = null;
+        motorWriteTicket++;
         gatt = targetDevice.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
     }
 
@@ -1363,6 +1414,13 @@ public class MainActivity extends Activity {
     @SuppressLint("MissingPermission")
     private void requestGattDisconnect() {
         stopHeartbeat();
+        cancelScheduledCommands();
+        stopAutoTune(false);
+        clearMotorPosition();
+        safeMotor.disconnected();
+        motorWrites.clear();
+        activeMotorWrite = null;
+        motorWriteTicket++;
         BluetoothGatt currentGatt = gatt;
         if (currentGatt != null && hasConnectPermission()) {
             appendLog("Disconnect requested");
@@ -1624,15 +1682,19 @@ public class MainActivity extends Activity {
 
     private boolean prepareMotion(String label, String hex) {
         Direction direction = directionForHex(hex);
-        if (direction == Direction.NONE) {
-            return true;
+        if (direction == Direction.NONE) return true;
+        if (!safeMotor.capable() || activityPaused) {
+            toast("Safe protocol not ready; manual motion blocked");
+            return false;
         }
-        if (blockedDirection == direction
-                && !(motorSafetyBackoffInProgress && blockedDirection == motorSafetyBackoffOriginLimit)) {
-            String message = directionName(direction) + " limit is active; use opposite direction";
-            appendLog(message);
-            setStatus(message);
-            toast(message);
+        if (safeMotor.pending() != null) {
+            failMotorSafety("Manual override: stop and release before continuing", true);
+            return false;
+        }
+        stopAutoTune(false);
+        clearMotorPosition();
+        if (blockedDirection == direction) {
+            setStatus(directionName(direction) + " limit is active; use opposite direction");
             return false;
         }
         currentDirection = direction;
@@ -1684,51 +1746,29 @@ public class MainActivity extends Activity {
     }
 
     private void onLimitActive(Direction limitDirection) {
-        long now = System.currentTimeMillis();
-        if (motorSafetyInitInProgress
-                && now - motorSafetySeekStartedAtMs < MOTOR_INIT_LIMIT_DEBOUNCE_MS) {
-            appendLogSafe("Init: ignored early limit " + directionName(limitDirection));
-            return;
-        }
         blockedDirection = limitDirection;
-        String message = directionName(limitDirection) + " limit active";
-        appendLogSafe(message);
-        runOnUiThread(() -> setStatus(message));
-        if (currentDirection != Direction.NONE) {
-            cancelScheduledCommands();
-            currentDirection = Direction.NONE;
-            sendCommand("LIMIT STOP", CMD_STOP);
-        }
-        if (motorSafetyInitInProgress) {
-            runOnUiThread(() -> {
-                if (autoText != null) {
-                    autoText.setText("Init: low limit active");
-                }
-                setStatus("Init: low limit active");
-            });
+        appendLog(directionName(limitDirection) + " limit active");
+        SafeMotorSession.Request request = safeMotor.pending();
+        if (request != null && (request.kind == SafeMotorSession.Kind.HOME
+                || request.kind == SafeMotorSession.Kind.RATCHET)) {
+            setStatus("Init: controller limit event " + directionName(limitDirection));
             return;
         }
-        if (motorSafetyBackoffInProgress) {
-            if (limitDirection == motorSafetyBackoffOriginLimit) {
-                appendLogSafe("Init backoff: leaving origin limit " + directionName(limitDirection));
-                return;
-            }
-            motorSafetyBackoffInProgress = false;
-            motorSafetyBackoffOriginLimit = Direction.NONE;
-            triggerSafetyVibration("Init backoff hit limit");
-            runOnUiThread(() -> {
-                if (autoText != null) {
-                    autoText.setText("Init: stopped by opposite limit");
-                }
-                setStatus("Init stopped by limit");
-            });
+        if (safeMotor.supportsRatchet() && limitDirection == Direction.RIGHT
+                && ((request != null && request.kind == SafeMotorSession.Kind.MOVE && request.direction == 2)
+                    || safeMotor.ratchetEligible())) {
+            setStatus("High limit: waiting for tagged controller result / remeasurement");
             return;
         }
-        if (autoTuning) {
-            autoTuning = false;
-            autoGeneration++;
-            runOnUiThread(() -> autoText.setText("Auto: stopped by limit"));
+        if (safeMotor.supportsRatchet() && limitDirection == Direction.LEFT && motorPositionRevFromLow == 0.0
+                && (request == null || (request.kind == SafeMotorSession.Kind.MOVE
+                    && request.direction == 2 && request.preloadMs == 0))) {
+            setStatus("Ratchet low origin; controller must confirm release on raising");
+            return;
         }
+        if (request != null || autoTuning || currentDirection != Direction.NONE) {
+            failMotorSafety("Limit active: " + directionName(limitDirection), true);
+        } else setStatus(directionName(limitDirection) + " limit active");
     }
 
     private void onLimitReleased(Direction limitDirection) {
@@ -1815,47 +1855,121 @@ public class MainActivity extends Activity {
     }
 
     @SuppressLint("MissingPermission")
-    private void sendCommand(String label, String rawHex) {
-        if (gatt == null || writeCharacteristic == null) {
-            toast("请先连接蓝牙电机板");
-            return;
+    private boolean sendCommand(String label, String rawHex) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            throw new IllegalStateException("Motor writes must be serialized on the UI thread");
         }
-        if (!hasConnectPermission()) {
-            requestNeededPermissions();
-            return;
-        }
-
+        if (gatt == null || writeCharacteristic == null || !hasConnectPermission()) return false;
         byte[] payload;
-        try {
-            payload = parseHex(rawHex);
-        } catch (IllegalArgumentException ex) {
-            toast(ex.getMessage());
-            return;
+        try { payload = parseHex(rawHex); }
+        catch (IllegalArgumentException ex) { toast(ex.getMessage()); return false; }
+        String hex = toHex(payload).replace(" ", "");
+        boolean stop = CMD_STOP.equals(hex) || "A10202000000011F".equals(hex);
+        boolean query = SafeMotorSession.CAPABILITIES_HEX.equals(hex) || CMD_INIT.equals(hex);
+        if ((activityPaused && !stop) || (!stop && !query && !safeMotor.capable())) {
+            setStatus("Safe protocol not ready; motor command blocked");
+            return false;
         }
-
-        writeCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
-        writeCharacteristic.setValue(payload);
-        boolean started = gatt.writeCharacteristic(writeCharacteristic);
-        appendLog(label + " -> " + toHex(payload) + " started=" + started);
+        boolean taggedMotion = hex.startsWith("A1F2") || hex.startsWith("A1F3") || (hex.startsWith("A1F1") && !query);
+        if (taggedMotion && (safeMotor.pending() == null || !safeMotor.pending().hex().equals(hex))) {
+            failMotorSafety("Untracked raw HOME/MOVE blocked", true);
+            return false;
+        }
+        if (stop) {
+            stopAutoTune(false);
+            motorWrites.clear();
+            if (safeMotor.pending() != null || safeMotor.ratchetEligible()) clearMotorPosition();
+        }
+        // Raw/manual HOLD must never preserve a stale automatic position.
+        if (hex.startsWith("A10101") || hex.startsWith("A10201")) {
+            if (safeMotor.pending() != null) {
+                failMotorSafety("Manual command attempted during automatic motion", true);
+                return false;
+            }
+            stopAutoTune(false);
+            clearMotorPosition();
+            currentDirection = hex.startsWith("A10101") ? Direction.LEFT : Direction.RIGHT;
+        }
+        if (motorWrites.size() >= 16) {
+            motorTransportFailure("Motor write queue overflow");
+            return false;
+        }
+        MotorWrite write = new MotorWrite(label, payload, commandGeneration, gatt, stop);
+        if (stop) motorWrites.addFirst(write); else motorWrites.addLast(write);
+        pumpMotorWrites();
+        return gatt != null;
     }
 
     @SuppressLint("MissingPermission")
-    private void sendCommandFromGattCallback(String label, String rawHex) {
-        if (gatt == null || writeCharacteristic == null || !hasConnectPermission()) {
+    private void pumpMotorWrites() {
+        if (activeMotorWrite != null || gatt == null || writeCharacteristic == null) return;
+        while (!motorWrites.isEmpty()) {
+            MotorWrite write = motorWrites.removeFirst();
+            if (write.owner != gatt || (!write.stop && (write.generation != commandGeneration || activityPaused))) continue;
+            activeMotorWrite = write;
+            long ticket = ++motorWriteTicket;
+            boolean started;
+            try {
+                writeCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+                writeCharacteristic.setValue(write.payload);
+                started = gatt.writeCharacteristic(writeCharacteristic);
+            } catch (RuntimeException ex) {
+                started = false;
+            }
+            appendLog(write.label + " -> " + toHex(write.payload) + " started=" + started);
+            if (!started) { motorTransportFailure("Motor BLE write rejected (no retry)"); return; }
+            handler.postDelayed(() -> {
+                if (activeMotorWrite == write && ticket == motorWriteTicket) {
+                    motorTransportFailure("Motor BLE write acknowledgement timeout (no retry)");
+                }
+            }, 1500L);
             return;
         }
-        byte[] payload;
-        try {
-            payload = parseHex(rawHex);
-        } catch (IllegalArgumentException ex) {
-            appendLogSafe(ex.getMessage());
-            return;
-        }
+    }
 
-        writeCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
-        writeCharacteristic.setValue(payload);
-        boolean started = gatt.writeCharacteristic(writeCharacteristic);
-        appendLogSafe(label + " -> " + toHex(payload) + " started=" + started);
+    private void clearMotorPosition() {
+        motorStrikeGate.cancel();
+        safeMotor.invalidate();
+        motorSafetyInitialized = false;
+        motorSafetyInitInProgress = false;
+        motorSafetyBackoffInProgress = false;
+        motorSafetyBackoffOriginLimit = Direction.NONE;
+        motorPositionRevFromLow = Double.NaN;
+        autoArmedForPianoStrike = false;
+    }
+
+    private void failMotorSafety(String reason, boolean sendStop) {
+        cancelScheduledCommands();
+        stopAutoTune(false);
+        clearMotorPosition();
+        motorWrites.clear();
+        pendingFreshHex = null;
+        pendingReplayVendorLr = false;
+        if (sendStop && gatt != null) sendCommand("SAFETY STOP", CMD_STOP);
+        appendLog(reason);
+        setStatus("Safety stop: " + reason + "; rehome required");
+        autoText.setText("Auto stopped: " + reason);
+        triggerSafetyVibration(reason);
+    }
+
+    private void motorTransportFailure(String reason) {
+        motorWrites.clear();
+        activeMotorWrite = null;
+        motorWriteTicket++;
+        failMotorSafety(reason, false);
+        safeMotor.disconnected();
+        disconnectGatt();
+    }
+
+    private void watchMotorRequest(SafeMotorSession.Request request, BluetoothGatt owner) {
+        handler.postDelayed(() -> {
+            if (owner != gatt || safeMotor.pending() != request) return;
+            if (safeMotor.expire(SystemClock.elapsedRealtime())) {
+                failMotorSafety("Controller START/DONE timeout; move will not be retried", true);
+                return;
+            }
+            watchMotorRequest(request, owner);
+        }, 200L);
     }
 
     private byte[] parseHex(String value) {
@@ -1944,31 +2058,55 @@ public class MainActivity extends Activity {
 
         listening = true;
         audioRecord.startRecording();
+        final AudioRecord recorder = audioRecord;
+        final int generation = ++audioGeneration;
         audioThread = new Thread(() -> {
             short[] buffer = new short[PITCH_BUFFER_SIZE];
-            while (listening && audioRecord != null) {
-                int read = audioRecord.read(buffer, 0, buffer.length);
+            while (listening && generation == audioGeneration) {
+                int read;
+                try { read = recorder.read(buffer, 0, buffer.length); }
+                catch (IllegalStateException ex) { break; }
+                long capturedAt = SystemClock.elapsedRealtime();
+                if (read <= 0) break;
                 if (read > 1024) {
                     double frequency = detectPitchYin(buffer, read);
                     float level = computeLevel(buffer, read);
                     short[] waveformBuffer = new short[read];
                     System.arraycopy(buffer, 0, waveformBuffer, 0, read);
-                    if (frequency > 0) {
-                        updatePitch(frequency, level, waveformBuffer, read);
-                    } else if (tunerView != null) {
-                        runOnUiThread(() -> {
-                            tunerView.setWaveform(level, waveformBuffer, read);
+                    final int frameSize = read;
+                    runOnUiThread(() -> {
+                        if (!listening || activityPaused || generation != audioGeneration) return;
+                        long now = SystemClock.elapsedRealtime();
+                        if (now - capturedAt > PianoStrikeGate.MAX_FRAME_GAP_MS) {
+                            if ((autoTuning || autoArmedForPianoStrike) && safeMotor.pending() == null) armMotorStrike(0);
+                            return;
+                        }
+                        if (motorStrikeGate.observe(capturedAt, level)) pitchCandidateFrames = 0;
+                        if (frequency > 0) {
+                            updatePitch(frequency, level, waveformBuffer, frameSize);
+                        } else if (tunerView != null) {
+                            pitchCandidateFrames = 0;
+                            tunerView.setWaveform(level, waveformBuffer, frameSize);
                             updatePianoScanNoPitch(level);
-                        });
-                    }
+                        }
+                    });
                 }
             }
+            runOnUiThread(() -> {
+                if (listening && generation == audioGeneration) {
+                    listening = false;
+                    motorStrikeGate.cancel();
+                    if (autoTuning || safeMotor.pending() != null) failMotorSafety("Audio stream stopped", true);
+                }
+            });
         }, "MAX-Pitch");
         audioThread.start();
     }
 
     private void stopPitchListening() {
         listening = false;
+        audioGeneration++;
+        motorStrikeGate.cancel();
         if (audioRecord != null) {
             try {
                 audioRecord.stop();
@@ -2074,7 +2212,8 @@ public class MainActivity extends Activity {
         latestMidi = midi;
         latestCents = cents;
         latestPitchMs = System.currentTimeMillis();
-        if (pitchReady) {
+        boolean motorPitchReady = pitchReady && motorStrikeGate.acceptStable(SystemClock.elapsedRealtime());
+        if (motorPitchReady) {
             latestStableFrequency = frequency;
             latestStableMidi = midi;
             latestStableCents = cents;
@@ -2097,7 +2236,13 @@ public class MainActivity extends Activity {
             }
             if (pitchReady) {
                 handlePianoScanPitch(frequency, midi, cents);
-                handleArmedAutoTunePitch(midi, cents);
+                if (motorPitchReady) {
+                    if (autoTuning && !isConfirmedTargetKey(autoTargetMidi, midi)) {
+                        triggerSafetyVibration("Wrong key during remeasurement");
+                        autoText.setText("Wrong key: allow quiet, then strike the selected key again");
+                        armMotorStrike(0);
+                    } else handleArmedAutoTunePitch(midi, cents);
+                }
             }
         });
     }
@@ -2168,6 +2313,10 @@ public class MainActivity extends Activity {
 
     private void handleVirtualPianoKeySelected(int midi) {
         int targetMidi = Math.max(21, Math.min(108, midi));
+        if (autoTuning && targetMidi == autoTargetMidi) {
+            toast("请等待电机停稳，再按实体钢琴键；续调不需要取下棘轮扳手");
+            return;
+        }
         if (pianoScanActive) {
             selectTargetMidi(targetMidi, true);
             return;
@@ -2197,70 +2346,39 @@ public class MainActivity extends Activity {
     }
 
     private void startMotorSafetyInitialization(int midi) {
-        if (gatt == null || writeCharacteristic == null) {
-            toast("请先连接蓝牙电机板");
-            showMotorDialog("请先连接蓝牙电机板");
+        if (!safeMotor.capable() || gatt == null || activityPaused) {
+            toast("需要已确认的安全协议固件；未连接或旧固件禁止初始化");
             return;
         }
-        stopAutoTune(true);
+        if (safeMotor.pending() != null) {
+            failMotorSafety("Stop active operation before rehoming", true);
+            return;
+        }
+        stopAutoTune(false);
+        cancelScheduledCommands();
+        clearMotorPosition();
+        motorWrites.clear();
         selectTargetMidi(midi, false);
-        motorSafetyInitialized = false;
         motorSafetyInitializedMidi = midi;
+        // Queue an explicit STOP before SPEED/HOME; transport responses preserve
+        // ordering even if a previous manual HOLD write was still in flight.
+        if (!sendCommand("PRE HOME STOP", CMD_STOP)) return;
+        SafeMotorSession.Request request;
+        try { request = safeMotor.home(SystemClock.elapsedRealtime()); }
+        catch (IllegalStateException ex) { failMotorSafety(ex.getMessage(), true); return; }
         motorSafetyInitInProgress = true;
-        motorSafetyBackoffInProgress = false;
-        blockedDirection = Direction.NONE;
-        motorSafetyBackoffOriginLimit = Direction.NONE;
-        motorPositionRevFromLow = Double.NaN;
-        autoArmedForPianoStrike = false;
-        if (autoText != null) {
-            autoText.setText("Init: ESP32 will seek low limit");
-        }
-        setStatus("Init: sending ESP32 HOME command");
-        beginCommandSequence();
-        int generation = commandGeneration;
         motorSafetySeekStartedAtMs = System.currentTimeMillis();
-        sendCommand("ESP32 HOME", CMD_HOME);
-        handler.postDelayed(() -> {
-            if (generation == commandGeneration && motorSafetyInitInProgress) {
-                cancelScheduledCommands();
-                motorSafetyInitInProgress = false;
-                currentDirection = Direction.NONE;
-                sendCommand("INIT SEEK TIMEOUT STOP", CMD_STOP);
-                triggerSafetyVibration("Init seek timeout");
-                setStatus("Init timeout: low limit not found");
-                if (autoText != null) {
-                    autoText.setText("Init: timeout, check limit switch");
-                }
-            }
-        }, MOTOR_INIT_SEEK_TIMEOUT_MS);
-    }
-
-    private void startMotorSafetyBackoff() {
-        motorSafetyInitInProgress = false;
-        motorSafetyBackoffInProgress = true;
-        if (autoText != null) {
-            autoText.setText("Init: low limit found, backing off 10 rev");
-        }
-        setStatus("Init: backing off 10 rev");
-        beginCommandSequence();
-        if (!prepareMotion("INIT BACKOFF RIGHT", CMD_RIGHT)) {
-            motorSafetyBackoffInProgress = false;
+        autoText.setText("Init: waiting for controller START");
+        setStatus("Init: tagged ESP32 HOME, remove wrench");
+        if (!sendCommand("HOME SPEED", speedCommandForPercent(autoSpeedPercent))
+                || !sendCommand("SAFE HOME #" + request.id, request.hex())) {
+            failMotorSafety("HOME send rejected; will not retry", true);
             return;
         }
-        int generation = commandGeneration;
-        startInitContinuousMotion(
-                "INIT BACKOFF RIGHT CONTINUOUS",
-                CMD_RIGHT,
-                () -> generation == commandGeneration,
-                generation
-        );
-        long backoffMs = Math.round(MOTOR_INIT_BACKOFF_REV * EXPERIENCE_REV_MS);
-        handler.postDelayed(() -> finishMotorSafetyInitialization(generation), backoffMs);
+        watchMotorRequest(request, gatt);
     }
 
-    private void startInitContinuousMotion(String label, String hex, MotionActiveCheck activeCheck, int generation) {
-        startContinuousCommand(label, hex, activeCheck, generation);
-    }
+
 
     private void startContinuousCommand(String label, String hex, MotionActiveCheck activeCheck, int generation) {
         if (generation != commandGeneration || !activeCheck.isActive()) {
@@ -2284,33 +2402,10 @@ public class MainActivity extends Activity {
         boolean isActive();
     }
 
-    private void finishMotorSafetyInitialization(int generation) {
-        if (generation != commandGeneration || !motorSafetyBackoffInProgress) {
-            return;
-        }
-        cancelScheduledCommands();
-        motorSafetyBackoffInProgress = false;
-        motorSafetyBackoffOriginLimit = Direction.NONE;
-        motorSafetyInitialized = true;
-        motorPositionRevFromLow = MOTOR_INIT_BACKOFF_REV;
-        currentDirection = Direction.NONE;
-        sendCommand("INIT BACKOFF STOP", CMD_STOP);
-        setStatus("Init complete: insert wrench");
-        if (autoText != null) {
-            autoText.setText("Init: complete, insert wrench");
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("放入扳手")
-                .setMessage("初始化完成。\n\n"
-                        + "现在请放入扳手，然后点击 APP 虚拟键盘上的 "
-                        + noteName(motorSafetyInitializedMidi)
-                        + "，再按下实体钢琴键。软件会确认钢琴音后才启动调律。")
-                .setPositiveButton("知道了", null)
-                .show();
-    }
 
     private void finishMotorSafetyInitializationFromEsp32() {
-        if (!motorSafetyInitInProgress && !motorSafetyBackoffInProgress) {
+        if (activityPaused || !safeMotor.homed()
+                || (!motorSafetyInitInProgress && !motorSafetyBackoffInProgress)) {
             return;
         }
         commandGeneration++;
@@ -2334,12 +2429,20 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private void armMotorStrike(long settleMs) {
+        latestStableFrequency = 0;
+        latestStablePitchMs = 0;
+        pitchCandidateFrames = 0;
+        motorStrikeGate.arm(SystemClock.elapsedRealtime(), settleMs);
+    }
+
     private void armAutoTuneForPianoStrike(int midi) {
         autoArmedForPianoStrike = true;
         autoTargetMidi = midi;
         autoTargetFrequency = targetFrequencyForMidi(midi);
         autoIgnorePitchBeforeMs = System.currentTimeMillis() + 250L;
         pitchCandidateFrames = 0;
+        armMotorStrike(Math.max(250L, suppressPitchUpdateUntilMs - System.currentTimeMillis()));
         if (autoText != null) {
             autoText.setText("Ready: press the physical piano key");
         }
@@ -2428,12 +2531,14 @@ public class MainActivity extends Activity {
             triggerSafetyVibration("Wrong key");
             autoText.setText("Wrong key: heard " + noteName(detectedMidi) + ", target " + noteName(autoTargetMidi));
             setStatus("Wrong key: press " + noteName(autoTargetMidi));
+            armMotorStrike(0);
             return;
         }
         if (!isCentsWithinMotorRange(autoTargetMidi, cents)) {
             triggerSafetyVibration("Pitch out of motor range");
             autoText.setText(String.format(Locale.US, "Out of range: %+.1f cents", cents));
             setStatus("Pitch out of motor range");
+            armMotorStrike(0);
             return;
         }
         autoArmedForPianoStrike = false;
@@ -2490,29 +2595,24 @@ public class MainActivity extends Activity {
         return clampInt((int) Math.round(rawMs), EXPERIENCE_MIN_PULSE_MS, autoExperienceMaxPulseMs);
     }
 
-    private void learnExperienceScale(double currentCents) {
+    private boolean learnExperienceScale(double currentCents) {
         if (autoLastDirection == Direction.NONE || Math.abs(autoLastExpectedDeltaCents) < 0.1) {
-            return;
+            return true;
         }
         double actualDelta = currentCents - autoLastObservedCents;
-        if (Math.signum(actualDelta) != Math.signum(autoLastExpectedDeltaCents) || Math.abs(actualDelta) < 0.2) {
-            if (Math.abs(actualDelta) >= 0.2
-                    && Math.signum(actualDelta) == -Math.signum(autoLastExpectedDeltaCents)) {
-                Direction oldRaise = autoRaiseDirection;
-                autoRaiseDirection = autoLowerDirection;
-                autoLowerDirection = oldRaise;
-                appendLog(String.format(Locale.US,
-                        "Auto direction reversed: expected %+.2f cents, actual %+.2f cents",
-                        autoLastExpectedDeltaCents,
-                        actualDelta));
-                autoText.setText("Auto: direction reversed from last result");
-                return;
-            }
+        TuningResponseSafety.Result result = TuningResponseSafety.evaluate(autoLastExpectedDeltaCents, actualDelta);
+        if (result != TuningResponseSafety.Result.CONSISTENT) {
             appendLog(String.format(Locale.US,
-                    "Auto learn skipped: expected %+.2f cents, actual %+.2f cents",
+                    "Auto response rejected (%s): expected %+.2f cents, actual %+.2f cents",
+                    result,
                     autoLastExpectedDeltaCents,
                     actualDelta));
-            return;
+            stopAutoTune(true);
+            autoArmedForPianoStrike = false;
+            triggerSafetyVibration("Unexpected tuning response: " + result);
+            autoText.setText("Auto stopped: unexpected response. Check direction/backlash and remeasure.");
+            setStatus("音高变化异常，已停止。请检查方向/间隙并重新击键确认；不会自动反转。");
+            return false;
         }
         double measuredFactor = Math.abs(actualDelta / autoLastExpectedDeltaCents);
         measuredFactor = clampDouble(measuredFactor, 0.25, 4.0);
@@ -2527,9 +2627,14 @@ public class MainActivity extends Activity {
                 actualDelta,
                 oldScale,
                 newScale));
+        return true;
     }
 
     private void startAutoTune() {
+        if (!safeMotor.capable() || !safeMotor.homed() || safeMotor.pending() != null || activityPaused) {
+            toast("需要安全协议固件、有效初始化且电机空闲；禁止旧协议自动调音");
+            return;
+        }
         if (!hasAudioPermission()) {
             requestNeededPermissions();
             return;
@@ -2554,8 +2659,8 @@ public class MainActivity extends Activity {
             return;
         }
         if (!hasFreshStablePitchForTarget(targetMidi)) {
-            toast("Play the selected key until pitch is stable");
-            autoText.setText("Auto: waiting for stable selected key");
+            armAutoTuneForPianoStrike(targetMidi);
+            autoText.setText("Auto: allow quiet, then strike the selected physical key");
             return;
         }
 
@@ -2580,37 +2685,18 @@ public class MainActivity extends Activity {
         applyExperienceAdjustment(false);
     }
 
-    private void finishAutoProbe() {
-        if (!autoTuning) {
-            return;
-        }
-        if (!hasFreshStablePitchForTarget(autoTargetMidi)) {
-            autoText.setText("Auto: play selected key again");
-            scheduleAuto(this::finishAutoProbe, 1000);
-            return;
-        }
-
-        double before = centsBetween(autoProbeFrequency, autoTargetFrequency);
-        double after = centsBetween(latestStableFrequency, autoTargetFrequency);
-        double delta = after - before;
-        if (delta < -0.5) {
-            autoLowerDirection = Direction.LEFT;
-            autoRaiseDirection = Direction.RIGHT;
-            autoText.setText("Auto: left lowers, right raises");
-        } else if (delta > 0.5) {
-            autoRaiseDirection = Direction.LEFT;
-            autoLowerDirection = Direction.RIGHT;
-            autoText.setText("Auto: left raises, right lowers");
-        } else {
-            autoLowerDirection = Direction.LEFT;
-            autoRaiseDirection = Direction.RIGHT;
-            autoText.setText("Auto: weak probe, using left lowers");
-        }
-        scheduleAuto(this::autoAdjustLoop, 700);
-    }
 
     private void autoAdjustLoop() {
         if (!autoTuning) {
+            return;
+        }
+        if (safeMotor.pending() != null) return;
+        if (safeMotor.ratchetEligible()) {
+            continueRatchetAfterRemeasurement();
+            return;
+        }
+        if (!safeMotor.homed()) {
+            failMotorSafety("Home position is no longer valid", true);
             return;
         }
         if (autoWaitingForRestrike) {
@@ -2641,8 +2727,8 @@ public class MainActivity extends Activity {
         }
 
         double cents = centsBetween(latestStableFrequency, autoTargetFrequency);
-        if (learnFromLastMove) {
-            learnExperienceScale(cents);
+        if (learnFromLastMove && !learnExperienceScale(cents)) {
+            return;
         }
         if (!isCentsWithinMotorRange(autoTargetMidi, cents)) {
             triggerSafetyVibration("Pitch out of motor range");
@@ -2661,6 +2747,10 @@ public class MainActivity extends Activity {
         }
 
         Direction direction = cents < 0 ? autoRaiseDirection : autoLowerDirection;
+        if (safeMotor.supportsRatchet() && cents > autoToleranceCents) {
+            failMotorSafety("Pitch is sharp: raising ratchet cannot auto-lower; check selector manually", true);
+            return;
+        }
         if (direction == Direction.NONE) {
             autoText.setText("Auto: direction unknown");
             stopAutoTune(true);
@@ -2697,72 +2787,71 @@ public class MainActivity extends Activity {
                 directionName(direction),
                 duration,
                 centsPerSecond));
-        int totalMotionMs = preloadMs + duration;
         if (!autoPulseWithPreload(direction, duration, preloadMs)) {
             stopAutoTune(true);
             return;
         }
-        autoWaitingForRestrike = true;
-        autoIgnorePitchBeforeMs = System.currentTimeMillis() + totalMotionMs + EXPERIENCE_RESTRIKE_ARM_MS;
-        scheduleAuto(this::autoAdjustLoop, totalMotionMs + autoSettleMs);
+        // Position updates and restrike scheduling happen ONLY on matching MOVE_DONE.
     }
 
-    private boolean autoPulse(Direction direction, int durationMs) {
-        String hex = direction == Direction.LEFT ? CMD_LEFT : CMD_RIGHT;
-        cancelScheduledCommands();
-        if (!prepareMotion("AUTO " + directionName(direction), hex)) {
-            return false;
+
+    private void continueRatchetAfterRemeasurement() {
+        if (!hasNewStablePitchForTarget(autoTargetMidi, autoIgnorePitchBeforeMs)) {
+            autoText.setText("High limit: play the selected physical key to confirm pitch");
+            scheduleAuto(this::autoAdjustLoop, 350L);
+            return;
         }
-        sendCommand("AUTO " + directionName(direction), hex);
-        int generation = autoGeneration;
-        handler.postDelayed(() -> {
-            if (generation == autoGeneration) {
-                updateMotorPositionAfterMove(direction, durationMs);
-                currentDirection = Direction.NONE;
-                sendCommand("AUTO STOP", CMD_STOP);
-            }
-        }, durationMs);
-        return true;
+        double cents = centsBetween(latestStableFrequency, autoTargetFrequency);
+        if (Math.abs(cents) <= autoToleranceCents) {
+            stopAutoTune(true);
+            tunerView.showCalibrationComplete();
+            autoText.setText(String.format(Locale.US, "Auto: done %.1f cents", cents));
+            return;
+        }
+        if (cents > 0 || cents < -TUNER_DIAL_CENTS_RANGE || cents < autoLastObservedCents - 2.0) {
+            failMotorSafety("Ratchet continuation rejected: sharp, out-of-range or unexpected pitch", true);
+            return;
+        }
+        SafeMotorSession.Request request;
+        try { request = safeMotor.ratchet(SystemClock.elapsedRealtime()); }
+        catch (IllegalStateException ex) { failMotorSafety(ex.getMessage(), true); return; }
+        autoLastDirection = Direction.NONE;
+        autoWaitingForRestrike = false;
+        currentDirection = Direction.LEFT;
+        motorStrikeGate.cancel();
+        latestStablePitchMs = 0;
+        autoText.setText("Ratchet freewheel return to low limit (" + safeMotor.ratchetCycles()
+                + "/" + SafeMotorSession.MAX_RATCHET_CYCLES + "); this is not pitch lowering");
+        if (!sendCommand("SAFE RATCHET #" + request.id, request.hex())) {
+            failMotorSafety("Ratchet send rejected; no retry", true);
+            return;
+        }
+        watchMotorRequest(request, gatt);
     }
 
     private boolean autoPulseWithPreload(Direction direction, int durationMs, int preloadMs) {
-        if (preloadMs <= 0) {
-            return autoPulse(direction, durationMs);
-        }
-        if (autoLowerDirection == Direction.NONE || direction == Direction.NONE) {
+        if (!safeMotor.capable() || !safeMotor.homed() || safeMotor.pending() != null
+                || Double.isNaN(motorPositionRevFromLow) || activityPaused) return false;
+        if (direction == Direction.NONE || direction == blockedDirection) return false;
+        Direction preloadDirection = direction == Direction.LEFT ? Direction.RIGHT : Direction.LEFT;
+        if (preloadMs > 0 && preloadDirection == blockedDirection) return false;
+        SafeMotorSession.Request request;
+        try {
+            request = safeMotor.move(direction == Direction.LEFT ? 1 : 2,
+                    durationMs, preloadMs, SystemClock.elapsedRealtime());
+        } catch (IllegalArgumentException | IllegalStateException ex) {
+            failMotorSafety(ex.getMessage(), true);
             return false;
         }
-        cancelScheduledCommands();
-        String preloadHex = autoLowerDirection == Direction.LEFT ? CMD_LEFT : CMD_RIGHT;
-        String finalHex = direction == Direction.LEFT ? CMD_LEFT : CMD_RIGHT;
-        if (!prepareMotion("AUTO PRELOAD " + directionName(autoLowerDirection), preloadHex)) {
+        currentDirection = direction;
+        autoWaitingForRestrike = false;
+        motorStrikeGate.cancel();
+        latestStablePitchMs = 0;
+        if (!sendCommand("SAFE MOVE #" + request.id, request.hex())) {
+            failMotorSafety("Timed move send rejected; no retry", true);
             return false;
         }
-        sendCommand("AUTO PRELOAD " + directionName(autoLowerDirection), preloadHex);
-        int generation = autoGeneration;
-        handler.postDelayed(() -> {
-            if (generation == autoGeneration) {
-                updateMotorPositionAfterMove(autoLowerDirection, preloadMs);
-                currentDirection = Direction.NONE;
-                sendCommand("AUTO PRELOAD STOP", CMD_STOP);
-            }
-        }, preloadMs);
-        handler.postDelayed(() -> {
-            if (generation == autoGeneration) {
-                if (!prepareMotion("AUTO " + directionName(direction), finalHex)) {
-                    stopAutoTune(true);
-                    return;
-                }
-                sendCommand("AUTO " + directionName(direction), finalHex);
-            }
-        }, preloadMs + 130L);
-        handler.postDelayed(() -> {
-            if (generation == autoGeneration) {
-                updateMotorPositionAfterMove(direction, durationMs);
-                currentDirection = Direction.NONE;
-                sendCommand("AUTO STOP", CMD_STOP);
-            }
-        }, preloadMs + 130L + durationMs);
+        watchMotorRequest(request, gatt);
         return true;
     }
 
@@ -2795,6 +2884,9 @@ public class MainActivity extends Activity {
 
     private void stopAutoTune(boolean sendStop) {
         autoTuning = false;
+        autoArmedForPianoStrike = false;
+        motorStrikeGate.cancel();
+        latestStablePitchMs = 0;
         autoGeneration++;
         autoWaitingForRestrike = false;
         autoLastDirection = Direction.NONE;
