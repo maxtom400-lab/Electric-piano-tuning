@@ -74,4 +74,20 @@ check(loop.indexOf('serviceLinkAndCommands()') < loop.indexOf('runHomeStateMachi
 check(readme.indexOf('## English') < readme.indexOf('## 中文'), 'README remains English first');
 check(readme.includes('### Open-Source Acknowledgements') && readme.includes('### 开源作者致谢')
   && readme.includes('Neil Kolban') && readme.includes('Haye Hinrichsen'), 'Bilingual acknowledgements retained');
+const view = body(app, 'private static class SteampunkTunerView');
+const gauge = body(view, 'private void drawNeedleGauge(');
+check(body(view, 'private void drawSkinnedTuner(').includes('drawNeedleGauge(')
+  && body(view, 'private void drawDial(').includes('drawNeedleGauge('), 'Same needle gauge in both display paths');
+check(view.includes('R.drawable.zhen') && !view.includes('drawSkinnedTopNeedle')
+  && !view.includes('drawSkinnedTopKey') && !view.includes('drawSkinnedWaveformDisplay'), 'No old fixed needle/marker/waveform layer');
+check((gauge.match(/canvas.rotate\(/g) || []).length === 1
+  && gauge.includes('canvas.rotate(DialGeometry.angleDegrees(displayCents), cx, cy)'), 'Only supplied needle rotates at defined cents scale');
+check(gauge.indexOf('drawBitmap(rotatingDialBitmap') < gauge.indexOf('canvas.rotate(')
+  && gauge.indexOf('restoreToCount(needleSave)') < gauge.indexOf('float hubRadius'), 'Fixed dial below needle below foreground note medallion');
+check(gauge.includes('DialGeometry.DIAL_PIVOT_X') && gauge.includes('DialGeometry.DIAL_PIVOT_Y')
+  && gauge.includes('DialGeometry.NEEDLE_PIVOT_X') && gauge.includes('DialGeometry.NEEDLE_PIVOT_Y'), 'Both supplied black-dot pivots used');
+check(gauge.includes('validMeasurement && now - measuredAtMs <= 2500L')
+  && gauge.includes('boolean complete = fresh &&') && gauge.includes('WAITING FOR PIANO'), 'Stale measurements cannot indicate completed calibration');
+check(body(view, 'void setSelectedMidi(').includes('validMeasurement = false')
+  && body(view, 'void setPitch(').includes('DialGeometry.finite(cents)'), 'Selection resets and invalid pitch is rejected for display');
 console.log(`PASS: ${checks} production source contracts (structural checks, not runtime/device verification)`);

@@ -2461,7 +2461,7 @@ public class MainActivity extends Activity {
             targetText.setText(String.format(Locale.US, "Target: %s %.1f Hz", note, target));
         }
         if (tunerView != null) {
-            tunerView.setSelectedMidi(selectedTargetMidi);
+            tunerView.setSelectedMidi(selectedTargetMidi, target);
         }
         if (playPreview && keyPreviewEnabled && pianoKeyPlayer != null) {
             suppressPitchUpdateUntilMs = System.currentTimeMillis() + 900L;
@@ -3392,7 +3392,6 @@ public class MainActivity extends Activity {
 
     private static class SteampunkTunerView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final RectF oval = new RectF();
         private final RectF keyboardBounds = new RectF();
         private final RectF leftGroupBounds = new RectF();
         private final RectF rightGroupBounds = new RectF();
@@ -3400,15 +3399,12 @@ public class MainActivity extends Activity {
         private final RectF skinDst = new RectF();
         private final RectF selectedKeyBounds = new RectF();
         private final RectF overlayDst = new RectF();
-        private final RectF waveformBounds = new RectF();
         private final RectF keyboardImageDst = new RectF();
         private final Rect bitmapSrc = new Rect();
-        private final short[] wave = new short[192];
         private final NoteSelectionListener selectionListener;
         private final Runnable menuListener;
         private static final float BLACK_TOP = 0f;
         private static final float BLACK_BOTTOM = 178f;
-        private static final float MIDDLE_DIAL_RADIUS_RATIO = 318f / 390f;
         private static final float[] BLACK_LEFT = {
                 56f, 169f, 237f, 343f, 421f, 487f, 604f, 672f, 778f, 856f, 914f, 1037f,
                 1106f, 1220f, 1290f, 1356f, 1468f, 1529f, 1652f, 1713f, 1787f, 1902f,
@@ -3427,7 +3423,7 @@ public class MainActivity extends Activity {
                 80, 82, 85, 87, 90, 92, 94, 97, 99, 102, 104, 106
         };
         private final Bitmap skinBitmap;
-        private final Bitmap topKeyBitmap;
+        private final Bitmap needleBitmap;
         private final Bitmap rotatingDialBitmap;
         private final Bitmap fullKeyboardBitmap;
         private final Bitmap pressBlackBitmap;
@@ -3445,7 +3441,6 @@ public class MainActivity extends Activity {
         private int groupStartMidi = 60;
         private float keyboardScrollPx;
         private float keyboardDragStartScrollPx;
-        private float gearRotationDegrees;
         private float touchDownX;
         private float touchDownY;
         private boolean keyboardDragMoved;
@@ -3454,13 +3449,15 @@ public class MainActivity extends Activity {
         private long rangeAlarmStartedMs;
         private long rangeAlarmUntilMs;
         private long calibrationCompleteUntilMs;
+        private long measuredAtMs;
+        private boolean validMeasurement;
 
         SteampunkTunerView(Context context, NoteSelectionListener selectionListener, Runnable menuListener) {
             super(context);
             this.selectionListener = selectionListener;
             this.menuListener = menuListener;
             skinBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.max_style_skin);
-            topKeyBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.top_key);
+            needleBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.zhen);
             rotatingDialBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.rotating_dial);
             fullKeyboardBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.full_keyboard);
             pressBlackBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.key_black_pressed);
@@ -3469,15 +3466,19 @@ public class MainActivity extends Activity {
             pressWhiteRightBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.key_white_right_pressed);
             paint.setStrokeCap(Paint.Cap.ROUND);
             paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            paint.setFilterBitmap(true);
         }
 
-        void setSelectedMidi(int midi) {
+        void setSelectedMidi(int midi, double target) {
             selectedMidi = Math.max(21, Math.min(108, midi));
+            this.target = target;
             groupStartMidi = groupStartForMidi(selectedMidi);
             note = noteNameLocal(selectedMidi);
             cents = 0;
             targetCents = 0;
             displayCents = 0;
+            validMeasurement = false;
+            calibrationCompleteUntilMs = 0;
             invalidate();
         }
 
@@ -3488,12 +3489,11 @@ public class MainActivity extends Activity {
 
         void setWaveform(float value, short[] buffer, int size) {
             level = value;
-            copyWaveform(buffer, size);
             invalidate();
         }
 
         void showCalibrationComplete() {
-            calibrationCompleteUntilMs = System.currentTimeMillis() + 3500L;
+            calibrationCompleteUntilMs = SystemClock.elapsedRealtime() + 3500L;
             invalidate();
         }
 
@@ -3501,10 +3501,12 @@ public class MainActivity extends Activity {
             this.note = note;
             this.frequency = frequency;
             this.target = target;
-            this.cents = Math.max(-TUNER_DIAL_CENTS_RANGE, Math.min(TUNER_DIAL_CENTS_RANGE, cents));
-            targetCents = (float) this.cents;
+            this.cents = cents;
+            validMeasurement = DialGeometry.finite(cents) && DialGeometry.finite(frequency) && frequency > 0;
+            measuredAtMs = SystemClock.elapsedRealtime();
+            targetCents = validMeasurement ? (float) Math.max(-DialGeometry.MAX_DISPLAY_CENTS,
+                    Math.min(DialGeometry.MAX_DISPLAY_CENTS, cents)) : 0f;
             this.level = level;
-            copyWaveform(buffer, size);
             invalidate();
         }
 
@@ -3512,26 +3514,14 @@ public class MainActivity extends Activity {
             this.note = note;
             this.frequency = frequency;
             this.target = target;
-            this.cents = Math.max(-TUNER_DIAL_CENTS_RANGE, Math.min(TUNER_DIAL_CENTS_RANGE, cents));
-            targetCents = cents < 0 ? (float) -TUNER_DIAL_CENTS_RANGE : (float) TUNER_DIAL_CENTS_RANGE;
-            this.level = level;
-            copyWaveform(buffer, size);
+            setPitch(note, frequency, target, cents, level, buffer, size);
+            calibrationCompleteUntilMs = 0;
             long now = System.currentTimeMillis();
             if (now > rangeAlarmUntilMs) {
                 rangeAlarmStartedMs = now;
             }
             rangeAlarmUntilMs = now + 1400L;
             invalidate();
-        }
-
-        private void copyWaveform(short[] buffer, int size) {
-            if (buffer == null || size <= 0) {
-                return;
-            }
-            int step = Math.max(1, size / wave.length);
-            for (int i = 0; i < wave.length; i++) {
-                wave[i] = buffer[Math.min(size - 1, i * step)];
-            }
         }
 
         @Override
@@ -3579,98 +3569,88 @@ public class MainActivity extends Activity {
             rightGroupBounds.set(left + sw * 0.83f, top + sh * 0.574f, left + sw * 1.00f, top + sh * 0.636f);
             keyboardBounds.set(left, top + sh * 0.636f, left + sw, top + sh * 0.965f);
 
-            drawStaticDialLayer(canvas, dialCx, dialCy, sw * 0.465f);
-            drawSkinnedWaveformDisplay(canvas, dialCx, dialCy + dpLocal(7), sw * 0.465f * MIDDLE_DIAL_RADIUS_RATIO);
+            drawNeedleGauge(canvas, dialCx, dialCy + dpLocal(7), sw * 0.465f);
             drawSkinnedFullKeyboard(canvas);
             drawSkinnedKeyHighlight(canvas);
             drawSkinnedGroupLabel(canvas, left, top, sw, sh);
-            drawSkinnedTopNeedle(canvas, dialCx, dialCy, sw * 0.58f);
-            drawSkinnedTopKey(canvas, dialCx, dialCy, sw * 0.58f);
-            drawSkinnedCenter(canvas, dialCx, dialCy + dpLocal(10), sw * 0.162f);
         }
 
-        private void drawStaticDialLayer(Canvas canvas, float cx, float cy, float radius) {
+        private void drawNeedleGauge(Canvas canvas, float cx, float cy, float radius) {
+            long now = SystemClock.elapsedRealtime();
+            boolean fresh = validMeasurement && now - measuredAtMs <= 2500L;
+            boolean complete = fresh && now <= calibrationCompleteUntilMs;
             paint.setAlpha(255);
-            float layerCy = cy + dpLocal(7);
-            drawStaticBitmap(canvas, rotatingDialBitmap, cx, layerCy, radius);
-        }
-
-        private void drawStaticBitmap(Canvas canvas, Bitmap bitmap, float cx, float cy, float radius) {
-            if (bitmap == null) {
-                return;
-            }
-            overlayDst.set(cx - radius, cy - radius, cx + radius, cy + radius);
-            canvas.drawBitmap(bitmap, null, overlayDst, paint);
-        }
-
-        private void drawSkinnedWaveformDisplay(Canvas canvas, float cx, float cy, float radius) {
-            waveformBounds.set(cx - radius, cy - radius, cx + radius, cy + radius);
-            int save = canvas.save();
-            canvas.clipPath(circlePath(cx, cy, radius));
-            boolean complete = System.currentTimeMillis() <= calibrationCompleteUntilMs;
-
-            paint.setShader(new RadialGradient(cx, cy, radius,
-                    complete ? Color.rgb(25, 118, 67) : Color.rgb(18, 28, 30),
-                    complete ? Color.rgb(0, 70, 38) : Color.rgb(4, 8, 10),
-                    Shader.TileMode.CLAMP));
             paint.setStyle(Paint.Style.FILL);
+            // Opaque backing hides the old gears/line baked into the skin.
+            paint.setShader(new RadialGradient(cx, cy, radius,
+                    Color.rgb(40, 36, 29), Color.rgb(10, 12, 13), Shader.TileMode.CLAMP));
             canvas.drawCircle(cx, cy, radius, paint);
             paint.setShader(null);
 
+            if (rotatingDialBitmap != null) {
+                float scale = radius * 2f / rotatingDialBitmap.getWidth();
+                float left = DialGeometry.origin(cx, DialGeometry.DIAL_PIVOT_X, scale);
+                float top = DialGeometry.origin(cy, DialGeometry.DIAL_PIVOT_Y, scale);
+                overlayDst.set(left, top, left + rotatingDialBitmap.getWidth() * scale,
+                        top + rotatingDialBitmap.getHeight() * scale);
+                // Keep the original ring, clipping stray pixels inside/outside it.
+                android.graphics.Path annulus = new android.graphics.Path();
+                annulus.setFillType(android.graphics.Path.FillType.EVEN_ODD);
+                annulus.addCircle(cx, cy, radius, android.graphics.Path.Direction.CW);
+                annulus.addCircle(cx, cy, radius * 0.79f, android.graphics.Path.Direction.CW);
+                int ringSave = canvas.save();
+                canvas.clipPath(annulus);
+                canvas.drawBitmap(rotatingDialBitmap, null, overlayDst, paint);
+                canvas.restoreToCount(ringSave);
+            }
+
+            if (needleBitmap != null) {
+                float scale = DialGeometry.needleScale(radius);
+                float left = DialGeometry.origin(cx, DialGeometry.NEEDLE_PIVOT_X, scale);
+                float top = DialGeometry.origin(cy, DialGeometry.NEEDLE_PIVOT_Y, scale);
+                overlayDst.set(left, top, left + needleBitmap.getWidth() * scale,
+                        top + needleBitmap.getHeight() * scale);
+                int needleSave = canvas.save();
+                // The ring never rotates. Only this bitmap rotates about its black dot.
+                canvas.rotate(DialGeometry.angleDegrees(displayCents), cx, cy);
+                paint.setAlpha(fresh ? 255 : 95);
+                canvas.drawBitmap(needleBitmap, null, overlayDst, paint);
+                canvas.restoreToCount(needleSave);
+            }
+            paint.setAlpha(255);
+            // Foreground note medallion deliberately covers the needle tail and pivot.
+            float hubRadius = radius * 0.29f;
+            paint.setColor(Color.rgb(69, 43, 27));
+            canvas.drawCircle(cx, cy, hubRadius, paint);
             paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Math.max(1f, radius * 0.006f));
-            paint.setColor(complete ? Color.argb(110, 210, 255, 220) : Color.argb(82, 80, 255, 190));
-            float grid = Math.max(dpLocal(10), radius * 0.18f);
-            for (float gx = cx - radius; gx <= cx + radius; gx += grid) {
-                canvas.drawLine(gx, cy - radius, gx, cy + radius, paint);
-            }
-            for (float gy = cy - radius; gy <= cy + radius; gy += grid) {
-                canvas.drawLine(cx - radius, gy, cx + radius, gy, paint);
-            }
-
-            paint.setColor(complete ? Color.argb(210, 220, 255, 225) : Color.argb(150, 135, 255, 210));
-            paint.setStrokeWidth(Math.max(1f, radius * 0.010f));
-            canvas.drawLine(cx - radius * 0.88f, cy, cx + radius * 0.88f, cy, paint);
-
-            paint.setColor(complete ? Color.rgb(0, 255, 76) : Color.rgb(82, 255, 168));
-            paint.setStrokeWidth(Math.max(dpLocal(2), radius * 0.018f));
-            float lastX = cx - radius * 0.90f;
-            float lastY = cy;
-            float gain = 0.32f + Math.min(0.38f, level * 0.55f);
-            for (int i = 0; i < wave.length; i++) {
-                float px = cx - radius * 0.90f + radius * 1.80f * i / (float) (wave.length - 1);
-                float py = complete
-                        ? cy - (float) Math.sin(i * Math.PI * 8.0 / (wave.length - 1)) * radius * 0.36f
-                        : cy - (wave[i] / 32768f) * radius * gain;
-                canvas.drawLine(lastX, lastY, px, py, paint);
-                lastX = px;
-                lastY = py;
-            }
-
+            paint.setStrokeWidth(radius * 0.016f);
+            paint.setColor(complete ? Color.rgb(62, 231, 121) : Color.rgb(218, 179, 87));
+            canvas.drawCircle(cx, cy, hubRadius * 0.96f, paint);
             paint.setStyle(Paint.Style.FILL);
             paint.setTextAlign(Paint.Align.CENTER);
-            paint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-            paint.setTextSize(radius * 0.105f);
-            paint.setColor(complete ? Color.WHITE : Color.argb(230, 190, 255, 225));
-            canvas.drawText(complete ? "CALIBRATION COMPLETE" : "Real-time Waveform Display", cx, cy - radius * 0.70f, paint);
+            paint.setColor(Color.rgb(210, 195, 157));
+            paint.setTextSize(radius * 0.070f);
+            canvas.drawText("FLAT", cx - radius * 0.51f, cy - radius * 0.05f, paint);
+            canvas.drawText("SHARP", cx + radius * 0.51f, cy - radius * 0.05f, paint);
+            paint.setColor(Color.rgb(246, 220, 157));
+            paint.setTextSize(radius * 0.23f);
+            canvas.drawText(noteNameLocal(selectedMidi), cx, cy + radius * 0.08f, paint);
+            paint.setTextSize(radius * 0.16f);
+            paint.setColor(complete ? Color.rgb(62, 231, 121) : Color.rgb(246, 220, 157));
+            canvas.drawText(fresh ? String.format(Locale.US, "%+.1f cents", cents) : "-- cents",
+                    cx, cy + radius * 0.47f, paint);
+            paint.setColor(Color.rgb(210, 195, 157));
+            paint.setTextSize(radius * 0.065f);
+            double selectedTarget = target > 0 && DialGeometry.finite(target)
+                    ? target : 440.0 * Math.pow(2.0, (selectedMidi - 69) / 12.0);
+            canvas.drawText(String.format(Locale.US, "TARGET %.2f Hz", selectedTarget),
+                    cx, cy + radius * 0.59f, paint);
+            canvas.drawText(fresh ? String.format(Locale.US, "HEARD %.2f Hz", frequency) : "WAITING FOR PIANO",
+                    cx, cy + radius * 0.69f, paint);
+            paint.setTextSize(radius * 0.055f);
+            canvas.drawText(complete ? "CALIBRATION COMPLETE" : "100 cents = 20 degrees",
+                    cx, cy + radius * 0.77f, paint);
             paint.setTextAlign(Paint.Align.LEFT);
-
-            canvas.restoreToCount(save);
-
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Math.max(dpLocal(2), radius * 0.016f));
-            paint.setColor(Color.argb(210, 238, 215, 159));
-            canvas.drawCircle(cx, cy, radius, paint);
-            paint.setStyle(Paint.Style.FILL);
-            if (complete) {
-                postInvalidateDelayed(33);
-            }
-        }
-
-        private android.graphics.Path circlePath(float cx, float cy, float radius) {
-            android.graphics.Path path = new android.graphics.Path();
-            path.addCircle(cx, cy, radius, android.graphics.Path.Direction.CW);
-            return path;
         }
 
         private void drawSkinnedGroupLabel(Canvas canvas, float left, float top, float sw, float sh) {
@@ -3851,49 +3831,6 @@ public class MainActivity extends Activity {
             paint.setStyle(Paint.Style.FILL);
         }
 
-        private void drawSkinnedCenter(Canvas canvas, float cx, float cy, float radius) {
-            paint.setAlpha(255);
-            paint.setShader(null);
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.argb(210, 78, 47, 27));
-            canvas.drawCircle(cx, cy, radius, paint);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Math.max(dpLocal(2), radius * 0.055f));
-            paint.setColor(Color.argb(230, 238, 215, 159));
-            canvas.drawCircle(cx, cy, radius * 0.94f, paint);
-            paint.setStyle(Paint.Style.FILL);
-            paint.setTextAlign(Paint.Align.CENTER);
-            paint.setColor(Color.rgb(238, 215, 159));
-            paint.setTextSize(radius * 0.36f);
-            canvas.drawText(String.format(Locale.US, "%+.1f", cents), cx, cy - radius * 0.18f, paint);
-            paint.setTextSize(radius * 0.66f);
-            canvas.drawText(noteNameLocal(selectedMidi), cx, cy + radius * 0.48f, paint);
-            paint.setTextAlign(Paint.Align.LEFT);
-        }
-
-        private void drawSkinnedTopNeedle(Canvas canvas, float cx, float cy, float radius) {
-            paint.setAlpha(255);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Math.max(4f, radius * 0.018f));
-            paint.setColor(Color.argb(180, 255, 238, 164));
-            canvas.drawLine(cx, cy - dpLocal(5), cx, cy - radius * 0.85f - dpLocal(5), paint);
-            paint.setStrokeWidth(Math.max(2f, radius * 0.008f));
-            paint.setColor(Color.rgb(95, 57, 27));
-            canvas.drawLine(cx, cy - dpLocal(5), cx, cy - radius * 0.82f - dpLocal(5), paint);
-        }
-
-        private void drawSkinnedTopKey(Canvas canvas, float cx, float cy, float radius) {
-            if (topKeyBitmap == null) {
-                return;
-            }
-            paint.setAlpha(255);
-            float width = radius * 0.30f;
-            float height = width * topKeyBitmap.getHeight() / (float) topKeyBitmap.getWidth();
-            float keyCenterY = cy - radius * 0.82f;
-            overlayDst.set(cx - width / 2f, keyCenterY - height * 0.62f, cx + width / 2f, keyCenterY + height * 0.38f);
-            canvas.drawBitmap(topKeyBitmap, null, overlayDst, paint);
-        }
-
         private void drawSkinnedKeyHighlight(Canvas canvas) {
             if (fullKeyboardBitmap == null || keyboardBounds.width() <= 0) {
                 return;
@@ -3967,14 +3904,13 @@ public class MainActivity extends Activity {
         }
 
         private void updateAnimationClock() {
-            long now = System.currentTimeMillis();
+            long now = SystemClock.elapsedRealtime();
             if (lastFrameMs == 0) {
                 lastFrameMs = now;
                 return;
             }
             long delta = Math.min(80, Math.max(0, now - lastFrameMs));
             lastFrameMs = now;
-            gearRotationDegrees = (gearRotationDegrees + delta * 0.045f) % 360f;
             displayCents += (targetCents - displayCents) * Math.min(1f, delta / 260f);
         }
 
@@ -4105,140 +4041,7 @@ public class MainActivity extends Activity {
         }
 
         private void drawDial(Canvas canvas, int cx, int cy, int r) {
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.rgb(92, 48, 30));
-            canvas.drawCircle(cx, cy, r + dpLocal(18), paint);
-            paint.setColor(Color.rgb(181, 121, 65));
-            canvas.drawCircle(cx, cy, r + dpLocal(10), paint);
-            paint.setColor(Color.rgb(245, 214, 128));
-            canvas.drawCircle(cx, cy, r, paint);
-            canvas.save();
-            canvas.rotate(-displayCents * 1.8f, cx, cy);
-            drawColorRing(canvas, cx, cy, r);
-            drawTicks(canvas, cx, cy, r);
-            drawGears(canvas, cx, cy, r);
-            canvas.restore();
-            drawNeedle(canvas, cx, cy, r);
-            drawCenter(canvas, cx, cy);
-        }
-
-        private void drawColorRing(Canvas canvas, int cx, int cy, int r) {
-            int[] colors = {
-                    Color.rgb(219, 85, 76), Color.rgb(238, 142, 72), Color.rgb(240, 201, 72),
-                    Color.rgb(116, 189, 94), Color.rgb(77, 177, 174), Color.rgb(89, 144, 214),
-                    Color.rgb(142, 103, 202), Color.rgb(221, 103, 154)
-            };
-            oval.set(cx - r + dpLocal(24), cy - r + dpLocal(24), cx + r - dpLocal(24), cy + r - dpLocal(24));
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(dpLocal(42));
-            for (int i = 0; i < 32; i++) {
-                paint.setColor(colors[i % colors.length]);
-                canvas.drawArc(oval, -90 + i * 11.25f, 10.5f, false, paint);
-            }
-        }
-
-        private void drawTicks(Canvas canvas, int cx, int cy, int r) {
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setColor(Color.rgb(48, 35, 23));
-            for (int value = -50; value <= 50; value += 5) {
-                double angle = angleForCents(value);
-                int len = value % 10 == 0 ? dpLocal(18) : dpLocal(10);
-                float x1 = (float) (cx + Math.cos(angle) * (r - dpLocal(30)));
-                float y1 = (float) (cy + Math.sin(angle) * (r - dpLocal(30)));
-                float x2 = (float) (cx + Math.cos(angle) * (r - dpLocal(30) - len));
-                float y2 = (float) (cy + Math.sin(angle) * (r - dpLocal(30) - len));
-                paint.setStrokeWidth(value % 10 == 0 ? dpLocal(2) : dpLocal(1));
-                canvas.drawLine(x1, y1, x2, y2, paint);
-            }
-            paint.setStyle(Paint.Style.FILL);
-            paint.setTextAlign(Paint.Align.CENTER);
-            paint.setTextSize(dpLocal(11));
-            for (int value = -50; value <= 50; value += 10) {
-                double angle = angleForCents(value);
-                float tx = (float) (cx + Math.cos(angle) * (r - dpLocal(66)));
-                float ty = (float) (cy + Math.sin(angle) * (r - dpLocal(66))) + dpLocal(4);
-                canvas.drawText(value == 0 ? "0" : (value > 0 ? "+" + value : String.valueOf(value)), tx, ty, paint);
-            }
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.rgb(247, 223, 135));
-            float topX = cx;
-            float topY = cy - r + dpLocal(22);
-            android.graphics.Path marker = new android.graphics.Path();
-            marker.moveTo(topX, topY + dpLocal(18));
-            marker.lineTo(topX - dpLocal(10), topY);
-            marker.lineTo(topX + dpLocal(10), topY);
-            marker.close();
-            canvas.drawPath(marker, paint);
-            paint.setTextAlign(Paint.Align.LEFT);
-        }
-
-        private void drawGears(Canvas canvas, int cx, int cy, int r) {
-            int[] colors = {Color.rgb(70, 156, 217), Color.rgb(239, 110, 86), Color.rgb(99, 194, 113),
-                    Color.rgb(222, 175, 57), Color.rgb(150, 101, 206)};
-            for (int i = 0; i < 18; i++) {
-                double angle = Math.toRadians(i * 20);
-                float gx = (float) (cx + Math.cos(angle) * (r * 0.45));
-                float gy = (float) (cy + Math.sin(angle) * (r * 0.45));
-                float phase = gearRotationDegrees * (i % 2 == 0 ? 1f : -1.25f) + i * 9f;
-                drawGear(canvas, gx, gy, dpLocal(10 + (i % 3) * 2), colors[i % colors.length], phase);
-            }
-        }
-
-        private void drawGear(Canvas canvas, float gx, float gy, int radius, int color, float phase) {
-            canvas.save();
-            canvas.rotate(phase, gx, gy);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(dpLocal(3));
-            paint.setColor(color);
-            for (int tooth = 0; tooth < 10; tooth++) {
-                double a = Math.toRadians(tooth * 36);
-                canvas.drawLine(
-                        (float) (gx + Math.cos(a) * radius * 0.82f),
-                        (float) (gy + Math.sin(a) * radius * 0.82f),
-                        (float) (gx + Math.cos(a) * radius * 1.30f),
-                        (float) (gy + Math.sin(a) * radius * 1.30f),
-                        paint
-                );
-            }
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(color);
-            canvas.drawCircle(gx, gy, radius, paint);
-            paint.setColor(Color.rgb(70, 48, 34));
-            canvas.drawCircle(gx, gy, Math.max(dpLocal(3), radius / 3f), paint);
-            canvas.restore();
-        }
-
-        private void drawNeedle(Canvas canvas, int cx, int cy, int r) {
-            double angle = angleForCents(0);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(dpLocal(8));
-            paint.setColor(Color.rgb(255, 236, 163));
-            canvas.drawLine(cx, cy, (float) (cx + Math.cos(angle) * (r - dpLocal(28))),
-                    (float) (cy + Math.sin(angle) * (r - dpLocal(28))), paint);
-            paint.setStrokeWidth(dpLocal(2));
-            paint.setColor(Color.rgb(91, 60, 34));
-            canvas.drawLine(cx, cy, (float) (cx + Math.cos(angle) * (r - dpLocal(22))),
-                    (float) (cy + Math.sin(angle) * (r - dpLocal(22))), paint);
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.rgb(241, 206, 104));
-            canvas.drawCircle(cx, cy - r + dpLocal(16), dpLocal(10), paint);
-        }
-
-        private double angleForCents(double value) {
-            return Math.toRadians(-90 + value * 1.8);
-        }
-
-        private void drawCenter(Canvas canvas, int cx, int cy) {
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.rgb(50, 45, 37));
-            canvas.drawCircle(cx, cy, dpLocal(66), paint);
-            paint.setColor(Color.rgb(232, 208, 155));
-            paint.setTextAlign(Paint.Align.CENTER);
-            paint.setTextSize(dpLocal(24));
-            canvas.drawText(String.format(Locale.US, "%+.1f", cents), cx, cy - dpLocal(16), paint);
-            paint.setTextSize(dpLocal(42));
-            canvas.drawText(note, cx, cy + dpLocal(32), paint);
-            paint.setTextAlign(Paint.Align.LEFT);
+            drawNeedleGauge(canvas, cx, cy, r);
         }
 
         private void drawControls(Canvas canvas, int w, int top) {

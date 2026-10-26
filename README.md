@@ -11,7 +11,7 @@ Project author: **MAX.YING · TROY HIGH SCHOOL · 2026**.
 ### Current Version
 
 - Real-time microphone pitch detection and an 88-key virtual keyboard.
-- A circular real-time waveform display that turns green when calibration completes; the old rotating rings and pointer are no longer used by the interface.
+- A fixed circular dial with the supplied gold needle: 12 o'clock is the selected target, flat is left and sharp is right. Only the needle rotates, at **20 degrees per semitone (0.2 degrees per cent)**, about the aligned black-dot pivots. The foreground note medallion covers its tail. Precise cents remain digital; stale readings fade and show a waiting state. The dial artwork's angle numerals are not cents labels.
 - BLE device name: `troy high school`. The app scans for this name instead of relying on the legacy board's fixed MAC address.
 - ESP32-local homing, forward/reverse control, and limit-switch protection, with status notifications to the app.
 - Estimated adjustment duration based on the selected note and an empirical response curve, with remeasurement and correction after another piano-key strike.
@@ -43,7 +43,7 @@ See the [ESP32 firmware guide](firmware/esp32_c3_piano_motor/README.md) for wiri
 3. ESP32 runs continuously toward the low-pitch limit, stops when the switch activates, waits 200ms, and reverses toward the high-pitch side.
 4. Backoff lasts 10 seconds by default, estimated as 10 revolutions at the assumed 60 RPM. After matching `HOME_DONE:ID`, the app asks the user to insert the wrench.
 5. Insert the wrench, select the target key in the app, and strike the physical piano key. Adjustment begins only after a stable pitch near the selected note is confirmed.
-6. Strike the key again to remeasure and correct using the previous adjustment result. The waveform turns green when the completion conditions are met.
+6. Strike the key again to remeasure and correct using the previous adjustment result. The note medallion border turns green briefly when the completion conditions are met; it does not force the needle to zero.
 
 ESP32 stops the motor when BLE disconnects and blocks motion toward an active limit. Both limits active, homing timeout, or reaching the opposite limit during backoff stops the motor and reports a protection status.
 
@@ -123,7 +123,7 @@ Android 钢琴调律辅助 APP，配合 ESP32-C3 蓝牙控制器、12V 有刷减
 ### 当前版本
 
 - 麦克风实时音高检测及 88 键虚拟键盘。
-- 圆形实时波形显示，完成标定后显示绿色波形；界面已不再使用旧的旋转圆环和指针图片。
+- 固定圆形表盘与原图金色指针：12 点为选定目标音，左低右高，只有指针旋转；按黑点对齐旋转轴，**每半音转 20 度（每音分 0.2 度）**。中央音名圆圈在前景盖住针尾；精确偏差由数字音分显示，过期读数变暗并提示等待。原图表盘的角度数字不是音分刻度。
 - 蓝牙设备名称：`troy high school`，由 APP 扫描并连接，不再锁定旧控制板的 MAC 地址。
 - ESP32 本地执行初始化、正反转及限位保护，并向 APP 回报状态。
 - 根据所选音高和经验曲线估算调节时间，支持再次击键后的复测与修正。
@@ -153,7 +153,7 @@ ESP32 及新的电机、限位组合尚待实物联调。转速、圈数、位�
 3. ESP32 持续向低音侧运行，碰到低音限位后停止，等待 200ms，再向高音侧回退。
 4. 默认回退 10 秒，按预设 60 RPM 估算为 10 圈；收到编号一致的 `HOME_DONE:编号` 后 APP 提示“放入扳手”。
 5. 放入扳手，点击 APP 的目标键，再按实体琴键。APP 确认稳定、接近目标的实际琴音后才开始调节。
-6. 再次击键后复测，根据上次调节结果修正；满足完成条件时波形显示为绿色。
+6. 再次击键后复测，根据上次调节结果修正；满足完成条件时中央音名圆圈边框短暂变绿，不强制把指针归零。
 
 ESP32 在蓝牙断开时停止电机；触发某侧限位后禁止继续向该侧运动。两侧限位同时触发、寻找限位超时、回退碰到另一侧限位均会停止并发送保护状态。
 
