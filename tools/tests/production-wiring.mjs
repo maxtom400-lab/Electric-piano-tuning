@@ -90,4 +90,6 @@ check(gauge.includes('validMeasurement && now - measuredAtMs <= 2500L')
   && gauge.includes('boolean complete = fresh &&') && gauge.includes('WAITING FOR PIANO'), 'Stale measurements cannot indicate completed calibration');
 check(body(view, 'void setSelectedMidi(').includes('validMeasurement = false')
   && body(view, 'void setPitch(').includes('DialGeometry.finite(cents)'), 'Selection resets and invalid pitch is rejected for display');
+check(gauge.includes('canvas.clipPath(dialClip)') && !gauge.includes('EVEN_ODD')
+  && !gauge.includes('radius * 0.79f'), 'Interior dial texture is not cut out');
 console.log(`PASS: ${checks} production source contracts (structural checks, not runtime/device verification)`);

@@ -59,7 +59,10 @@ public final class DialGeometryTest {
         check(needle.getColorModel().hasAlpha() && dial.getColorModel().hasAlpha());
         check((needle.getRGB(0, 0) >>> 24) == 0 && (dial.getRGB(0, 0) >>> 24) == 0);
         pivot(needle, DialGeometry.NEEDLE_PIVOT_X, DialGeometry.NEEDLE_PIVOT_Y, 24, 387, 56, 420);
-        pivot(dial, DialGeometry.DIAL_PIVOT_X, DialGeometry.DIAL_PIVOT_Y, 480, 480, 550, 550);
+        // Artwork may cover the old dot. Assert the locked geometry, not pixel color.
+        close(DialGeometry.DIAL_PIVOT_X, 514.5);
+        close(DialGeometry.DIAL_PIVOT_Y, 512.5);
+        check(DialGeometry.DIAL_PIVOT_X < dial.getWidth() && DialGeometry.DIAL_PIVOT_Y < dial.getHeight());
         System.out.println("PASS: " + checks + " needle scale/pivot/original-asset checks");
     }
 }

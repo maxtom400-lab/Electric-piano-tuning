@@ -4,7 +4,8 @@ package com.example.bluetoothmotor;
 final class DialGeometry {
     static final double DEGREES_PER_CENT = 20.0 / 100.0;
     static final double MAX_DISPLAY_CENTS = 200.0;
-    // Pixel centers of the black alignment dots in the supplied original PNGs.
+    // Locked pixel centers measured from the original black alignment dots.
+    // Keep these coordinates when the dial artwork changes or covers its dot.
     static final float DIAL_PIVOT_X = 514.5f;
     static final float DIAL_PIVOT_Y = 512.5f;
     static final float NEEDLE_PIVOT_X = 40.5f;

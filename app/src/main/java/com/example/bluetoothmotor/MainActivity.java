@@ -3593,13 +3593,11 @@ public class MainActivity extends Activity {
                 float top = DialGeometry.origin(cy, DialGeometry.DIAL_PIVOT_Y, scale);
                 overlayDst.set(left, top, left + rotatingDialBitmap.getWidth() * scale,
                         top + rotatingDialBitmap.getHeight() * scale);
-                // Keep the original ring, clipping stray pixels inside/outside it.
-                android.graphics.Path annulus = new android.graphics.Path();
-                annulus.setFillType(android.graphics.Path.FillType.EVEN_ODD);
-                annulus.addCircle(cx, cy, radius, android.graphics.Path.Direction.CW);
-                annulus.addCircle(cx, cy, radius * 0.79f, android.graphics.Path.Direction.CW);
+                // Preserve the user's interior texture; trim only outside the dial.
+                android.graphics.Path dialClip = new android.graphics.Path();
+                dialClip.addCircle(cx, cy, radius, android.graphics.Path.Direction.CW);
                 int ringSave = canvas.save();
-                canvas.clipPath(annulus);
+                canvas.clipPath(dialClip);
                 canvas.drawBitmap(rotatingDialBitmap, null, overlayDst, paint);
                 canvas.restoreToCount(ringSave);
             }
