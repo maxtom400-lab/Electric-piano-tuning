@@ -6,6 +6,7 @@ const read = path => readFile(new URL('../../' + path, import.meta.url), 'utf8')
 const app = await read('app/src/main/java/com/example/bluetoothmotor/MainActivity.java');
 const firmware = await read('firmware/esp32_c3_piano_motor/esp32_c3_piano_motor.ino');
 const readme = await read('README.md');
+const detector = await read('app/src/main/java/com/example/bluetoothmotor/FftPitchDetector.java');
 let checks = 0;
 function check(condition, message) { assert.ok(condition, message); checks++; }
 
@@ -49,6 +50,18 @@ check(pitch.includes('motorStrikeGate.acceptStable') && pitch.includes('if (moto
 check((app.match(/latestStableFrequency = frequency/g) || []).length === 1, 'No continuous stable-frame refresh of motor pitch');
 check(audio.indexOf('motorStrikeGate.observe(capturedAt, level)') < audio.indexOf('updatePitch(frequency'), 'Envelope gate precedes pitch control');
 check(audio.includes('generation != audioGeneration') && audio.includes('MAX_FRAME_GAP_MS'), 'Old/stale audio samples rejected');
+check(audio.includes('FftPitchDetector detector = new FftPitchDetector()')
+  && audio.includes('detector.detect(buffer, PITCH_BUFFER_SIZE)'), 'Per-generation FFT core used on capture thread');
+check(audio.includes('recorder.read(buffer, frames.offset(), frames.remaining())')
+  && audio.indexOf('frames.commitRead(read, capturedAt)') < audio.indexOf('detector.detect('), 'Partial reads assembled before pitch analysis');
+check(!audio.includes('new short[read]') && !audio.includes('waveformBuffer')
+  && audio.includes('updatePitch(frequency, level, null, 0)'), 'No mutable PCM buffer crosses to UI');
+check(audio.includes('final boolean discontinuity = frames.discontinuity()')
+  && audio.indexOf('if (discontinuity)') < audio.indexOf('motorStrikeGate.observe('), 'Capture discontinuity invalidates strike/stability before control');
+check(!app.includes('detectPitchYin(') && !detector.includes('selectedTargetMidi')
+  && !detector.includes('android.bluetooth'), 'No old detector fallback, target pulling or BLE in DSP core');
+check(detector.indexOf('// All lags are normalized') < detector.indexOf('if (isValley(lag)')
+  && detector.includes('FFT_SIZE = FRAME_SIZE * 2'), 'Complete normalization and linear-correlation padding');
 check(body(app, 'private void startMotorSafetyInitialization(').includes('safeMotor.home(SystemClock.elapsedRealtime())'), 'Tagged monotonic HOME');
 check(pulse.includes('safeMotor.move(') && pulse.includes('request.hex()') && !pulse.includes('handler.postDelayed'), 'Controller-owned complete timed sequence');
 check(!app.includes('AUTO PRELOAD STOP') && !app.includes('finishAutoProbe') && !app.includes('startMotorSafetyBackoff'), 'No phone-side preload/homing/probe fallback');

@@ -7,9 +7,9 @@
 Both builds succeed for this development snapshot:
 
 - Android: Gradle 8.7, Android Gradle Plugin 8.5, compile/target SDK 35, debug APK. Existing SDK/plugin and Java 8-target deprecation warnings remain.
-- Firmware: Arduino-ESP32 **3.3.8**, `esp32:esp32:esp32c3:CDCOnBoot=cdc`. Compile only, no serial port or device access. Current image uses 629,687 / 1,310,720 bytes flash (48%) and 18,980 / 327,680 bytes static RAM (5%).
+- Firmware (unchanged; last full compile): Arduino-ESP32 **3.3.8**, `esp32:esp32:esp32c3:CDCOnBoot=cdc`. Compile only, no serial port or device access. Current image uses 629,687 / 1,310,720 bytes flash (48%) and 18,980 / 327,680 bytes static RAM (5%).
 
-Motor/audio behavioral tests: **459 checks**, including 16 tuning-response checks, 80 basic request/session checks, 82 ratchet-session checks, 95 acoustic-strike-gate checks, 81 C++ motor-core checks, and 105 C++ parser/manual-lease checks. Another **40 structural source contracts** cover production control wiring and the needle display. Structural checks are not runtime integration tests.
+Motor/audio behavioral tests: **459 checks**, including 16 tuning-response checks, 80 basic request/session checks, 82 ratchet-session checks, 95 acoustic-strike-gate checks, 81 C++ motor-core checks, and 105 C++ parser/manual-lease checks. Another **46 structural source contracts** cover production control wiring, capture/DSP integration and the needle display. Structural checks are not runtime integration tests.
 
 The same C++ core/parser sources used by firmware are compiled to WebAssembly with Android NDK LLVM and run on Node for host simulation. The Java tests run without Android or Bluetooth. They exercise local time limits, replay rejection, limit/disconnect/abort behavior, ratchet eligibility/cycle caps, callback wiring, and quiet/onset/one-sample gating. Passing them does not verify radio delivery, real-time scheduling, electrical signals, physical travel, torque, acoustic source identity, or piano tuning accuracy.
 
@@ -23,10 +23,15 @@ Version code 4 / version 1.3 was installed over USB on a Xiaomi M2101K9C (1080×
 
 The updated 1024×1024 dial PNG includes the user's blue interior texture. Only the outside is circularly clipped; the interior is no longer cut out. The original dial pivot **(514.5, 512.5)** and needle pivot **(40.5, 401.5)**, scale and foreground note circle remain unchanged. Tests assert the locked dial coordinates rather than searching for its now-covered black dot; the 56 geometry/asset checks and 40 source contracts pass. Android builds successfully, and version code 5 / 1.3.1 was installed and screenshot-checked on the same USB Xiaomi phone. No motor command was sent; live acoustic/motor verification remains incomplete.
 
+### FFT core 1.4 (2026-10-26)
+
+The new FFT-accelerated, YIN-style core and complete-frame reader are integrated on the capture thread, retaining the stale-generation/frame and fresh-strike motor guards. **4717 synthetic pitch/numerical assertions** and **24692 PCM framing assertions** pass on both the host and the USB Xiaomi M2101K9C ART. Most framing assertions compare individual samples, not independent sound scenarios. The old/new core medians on this phone were 4.573 / 0.847 ms (5.40×); this is generated-PCM computation, **not** microphone-to-display latency. Existing motor/audio and dial regressions pass. Full methodology, limitations, old baseline and scripts: [PITCH_ENGINE.md](PITCH_ENGINE.md). No BLE connection or motor motion was part of these checks.
+
 ### Reproduce
 
 ```powershell
 ./tools/test-safety.ps1
+./tools/test-pitch.ps1
 ./tools/test-motor-core.ps1
 ./tools/build-firmware.ps1
 ```
@@ -45,7 +50,7 @@ Measure loaded speed, stopping distance, mechanical backlash, RPM/travel/cents r
 
 Android debug 构建及 Arduino-ESP32 **3.3.8** 的 ESP32-C3 固件编译均通过。固件配置为 `esp32:esp32:esp32c3:CDCOnBoot=cdc`，只编译、不选串口、不连接设备、不烧录。当前固件占用 Flash 629,687 / 1,310,720 字节（48%），静态 RAM 18,980 / 327,680 字节（5%）。Android 原有工具链兼容/弃用警告仍存在。
 
-共 **459 项电机/音频行为逻辑测试**通过：音高响应 16、基础会话/编号 80、棘轮会话 82、声学起音门控 95、C++ 电机核心 81、C++ 协议/手动租约 105。另有 **40 项源码结构检查**覆盖生产保护入口与指针显示；结构检查不是运行时集成测试。C++ 核心在主机编译为 WebAssembly 后模拟执行，Java 测试不使用 Android/蓝牙，不能代表实物验证。
+共 **459 项电机/音频行为逻辑测试**通过：音高响应 16、基础会话/编号 80、棘轮会话 82、声学起音门控 95、C++ 电机核心 81、C++ 协议/手动租约 105。另有 **46 项源码结构检查**覆盖生产保护入口、收音/DSP 接入与指针显示；结构检查不是运行时集成测试。C++ 核心在主机编译为 WebAssembly 后模拟执行；这些测试不使用真实蓝牙/电机，不能代表实体控制验证。
 
 ### 指针界面 1.3（2026-10-26）
 
@@ -56,6 +61,10 @@ Android debug 构建通过；`zhen.png`、`rotating_dial.png` 原图逐字节复
 ### 底纹更新 1.3.1（2026-10-26）
 
 更新后的 1024×1024 大圈 PNG 带用户提供的蓝色底纹，仅裁剪圆外部分，不再挖空圆内底纹。沿用原大圈圆心 **(514.5, 512.5)**、指针圆心 **(40.5, 401.5)**、缩放比例与前景音名圆圈。测试改为检查锁定的大圈坐标，不再查找被底纹盖住的黑点；56 项几何/图片检查及 40 项源码检查通过。Android 构建成功，versionCode 5 / 1.3.1 已安装至同一台 USB 小米手机并查看截图确认显示。未发送电机指令，实琴收音及电机验证仍未完成。
+
+### FFT 核心 1.4（2026-10-26）
+
+FFT 加速 YIN 型核心及完整拼帧已接入收音线程，保留旧录音代次/旧帧过滤与真实新击键电机门控。主机及 USB 小米 M2101K9C ART 均通过 **4717 项合成音/数值断言**和 **24692 项 PCM 拼帧断言**；多数拼帧断言为逐样本比较，并非独立声学场景。手机旧/新核心中位耗时 4.573 / 0.847 ms，约 5.40 倍，仅代表合成 PCM 的核心计算，**不代表麦克风到显示的完整延迟**。原电机/音频及表盘定位回归通过。方法、旧版对照、脚本及限制详见 [PITCH_ENGINE.md](PITCH_ENGINE.md)。上述检查未连接蓝牙或驱动电机，固件未改动。
 
 ### 复现及实物门槛
 

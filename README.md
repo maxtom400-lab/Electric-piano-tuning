@@ -10,7 +10,7 @@ Project author: **MAX.YING · TROY HIGH SCHOOL · 2026**.
 
 ### Current Version
 
-- Real-time microphone pitch detection and an 88-key virtual keyboard.
+- Real-time microphone pitch detection and an 88-key virtual keyboard. Version 1.4 uses a reusable FFT-accelerated, YIN-style core, full-frame PCM assembly and harmonic consistency checks; it does not pull detected pitch toward the selected key. See [pitch engine and reproducible validation](docs/PITCH_ENGINE.md).
 - A fixed circular dial with the supplied gold needle: 12 o'clock is the selected target, flat is left and sharp is right. Only the needle rotates, at **20 degrees per semitone (0.2 degrees per cent)**, about the aligned black-dot pivots. The foreground note medallion covers its tail. Precise cents remain digital; stale readings fade and show a waiting state. The dial artwork's angle numerals are not cents labels.
 - BLE device name: `troy high school`. The app scans for this name instead of relying on the legacy board's fixed MAC address.
 - ESP32-local homing, forward/reverse control, and limit-switch protection, with status notifications to the app.
@@ -101,7 +101,7 @@ Thank you to the following authors, maintainers, and researchers for sharing the
 
 - **Espressif Systems and all Arduino-ESP32 contributors**: [Arduino-ESP32](https://github.com/espressif/arduino-esp32) provides the Arduino framework, GPIO/PWM, and BLE support used by the ESP32 firmware.
 - **Neil Kolban and subsequent ESP32 BLE maintainers**: thank you for the open-source [ESP32 BLE work](https://github.com/nkolban/ESP32_BLE_Arduino) and continued maintenance of the [Arduino-ESP32 BLE library](https://github.com/espressif/arduino-esp32/tree/master/libraries/BLE). Firmware uses its BLEDevice, BLEServer, and BLECharacteristic interfaces.
-- **Alain de Cheveigné and Hideki Kawahara**: thank you for the [YIN pitch-detection algorithm](https://pubmed.ncbi.nlm.nih.gov/12002874/). The app's `detectPitchYin` implements the YIN method; this acknowledgement credits the underlying research.
+- **Alain de Cheveigné and Hideki Kawahara**: thank you for the [YIN pitch-detection research](https://pubmed.ncbi.nlm.nih.gov/12002874/). The app's locally written `FftPitchDetector` uses a YIN-style normalized difference function with FFT acceleration and project-specific safeguards; it is not the authors' reference implementation. This acknowledgement credits the underlying research.
 - **Haye Hinrichsen, Christoph Wick, and Entropy Piano Tuner contributors**: thank you for [Entropy Piano Tuner](https://gitlab.com/tp3/Entropy-Piano-Tuner) and its open-source work on piano recording, stretch tuning, and entropy-based tuning. Author attribution is documented in the [original copyright notice mirror](https://github.com/levush/Entropy-Piano-Tuner/blob/master/COPYRIGHT). This project references its workflow and research direction; it does not currently integrate its entropy optimizer.
 
 Copyright and licenses for these projects and research belong to their respective authors. Acknowledgement does not alter upstream license terms or imply participation or endorsement by those authors.
@@ -122,7 +122,7 @@ Android 钢琴调律辅助 APP，配合 ESP32-C3 蓝牙控制器、12V 有刷减
 
 ### 当前版本
 
-- 麦克风实时音高检测及 88 键虚拟键盘。
+- 麦克风实时音高检测及 88 键虚拟键盘。1.4 版采用复用缓冲区的 FFT 加速 YIN 型核心、完整 PCM 分帧与谐波一致性检查，不会把测量结果拉向用户选定的琴键。详见[音高算法与可复现验证](docs/PITCH_ENGINE.md)。
 - 固定圆形表盘与原图金色指针：12 点为选定目标音，左低右高，只有指针旋转；按黑点对齐旋转轴，**每半音转 20 度（每音分 0.2 度）**。中央音名圆圈在前景盖住针尾；精确偏差由数字音分显示，过期读数变暗并提示等待。原图表盘的角度数字不是音分刻度。
 - 蓝牙设备名称：`troy high school`，由 APP 扫描并连接，不再锁定旧控制板的 MAC 地址。
 - ESP32 本地执行初始化、正反转及限位保护，并向 APP 回报状态。
@@ -211,7 +211,7 @@ ESP32：打开 [esp32_c3_piano_motor.ino](firmware/esp32_c3_piano_motor/esp32_c3
 
 - **Espressif Systems 与 Arduino-ESP32 全体贡献者**：感谢 [Arduino-ESP32](https://github.com/espressif/arduino-esp32) 提供 ESP32 的 Arduino 开发框架、GPIO/PWM 和 BLE 支持。本项目 ESP32 固件依赖该框架。
 - **Neil Kolban 及 ESP32 BLE 库的后续维护者**：感谢其开源的 [ESP32 BLE 工作](https://github.com/nkolban/ESP32_BLE_Arduino)，以及 [Arduino-ESP32 BLE 库](https://github.com/espressif/arduino-esp32/tree/master/libraries/BLE) 的持续维护。本固件使用其中的 BLEDevice、BLEServer、BLECharacteristic 等接口。
-- **Alain de Cheveigné、Hideki Kawahara**：感谢提出 [YIN 音高检测算法](https://pubmed.ncbi.nlm.nih.gov/12002874/)。APP 中的 `detectPitchYin` 根据 YIN 方法实现；此处注明算法研究来源。
+- **Alain de Cheveigné、Hideki Kawahara**：感谢提出 [YIN 音高检测研究](https://pubmed.ncbi.nlm.nih.gov/12002874/)。APP 自行编写的 `FftPitchDetector` 使用 YIN 型归一化差分、FFT 加速及本项目保护规则，并非原作者的参考实现；此处注明算法研究来源。
 - **Haye Hinrichsen、Christoph Wick 及 Entropy Piano Tuner 贡献者**：感谢 [Entropy Piano Tuner](https://gitlab.com/tp3/Entropy-Piano-Tuner) 在钢琴录音、拉伸调律及熵调律研究方面的开源工作；作者署名可见 [原项目版权声明镜像](https://github.com/levush/Entropy-Piano-Tuner/blob/master/COPYRIGHT)。本项目将其作为调律流程和研究方向的参考，当前未集成其熵优化求解器。
 
 以上项目和研究成果的版权与许可证归各自作者所有；致谢不改变上游许可条款，也不代表上游作者参与本项目或为本项目背书。

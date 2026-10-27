@@ -70,10 +70,8 @@ public class MainActivity extends Activity {
     private static final long SCAN_MS = 20_000L;
     private static final long HEARTBEAT_MS = 10 * 60 * 1000L;
     private static final int PIANO_SCAN_SAMPLES_REQUIRED = 3;
-    private static final int SAMPLE_RATE = 44100;
-    private static final int PITCH_BUFFER_SIZE = 4096;
-    private static final double MIN_PIANO_FREQ = 27.5;
-    private static final double MAX_PIANO_FREQ = 4186.0;
+    private static final int SAMPLE_RATE = FftPitchDetector.SAMPLE_RATE;
+    private static final int PITCH_BUFFER_SIZE = FftPitchDetector.FRAME_SIZE;
     private static final double TUNER_DIAL_CENTS_RANGE = 200.0;
     private static final float TUNER_DIAL_DEGREES_RANGE = 270f;
     private static final float TUNER_DIAL_DEGREES_PER_CENT =
@@ -2061,32 +2059,41 @@ public class MainActivity extends Activity {
         final AudioRecord recorder = audioRecord;
         final int generation = ++audioGeneration;
         audioThread = new Thread(() -> {
-            short[] buffer = new short[PITCH_BUFFER_SIZE];
+            // Each recording generation owns its DSP state; no mutable buffers cross to UI.
+            FftPitchDetector detector = new FftPitchDetector();
+            PcmFrameBuffer frames = new PcmFrameBuffer(PITCH_BUFFER_SIZE, PianoStrikeGate.MAX_FRAME_GAP_MS);
+            short[] buffer = frames.samples();
             while (listening && generation == audioGeneration) {
                 int read;
-                try { read = recorder.read(buffer, 0, buffer.length); }
+                try { read = recorder.read(buffer, frames.offset(), frames.remaining()); }
                 catch (IllegalStateException ex) { break; }
                 long capturedAt = SystemClock.elapsedRealtime();
                 if (read <= 0) break;
-                if (read > 1024) {
-                    double frequency = detectPitchYin(buffer, read);
-                    float level = computeLevel(buffer, read);
-                    short[] waveformBuffer = new short[read];
-                    System.arraycopy(buffer, 0, waveformBuffer, 0, read);
-                    final int frameSize = read;
+                boolean full;
+                try { full = frames.commitRead(read, capturedAt); }
+                catch (IllegalArgumentException ex) { break; }
+                if (full) {
+                    double frequency = detector.detect(buffer, PITCH_BUFFER_SIZE);
+                    float level = computeLevel(buffer, PITCH_BUFFER_SIZE);
+                    final boolean discontinuity = frames.discontinuity();
+                    frames.consume();
                     runOnUiThread(() -> {
                         if (!listening || activityPaused || generation != audioGeneration) return;
                         long now = SystemClock.elapsedRealtime();
+                        if (discontinuity) {
+                            pitchCandidateFrames = 0;
+                            if ((autoTuning || autoArmedForPianoStrike) && safeMotor.pending() == null) armMotorStrike(0);
+                        }
                         if (now - capturedAt > PianoStrikeGate.MAX_FRAME_GAP_MS) {
                             if ((autoTuning || autoArmedForPianoStrike) && safeMotor.pending() == null) armMotorStrike(0);
                             return;
                         }
                         if (motorStrikeGate.observe(capturedAt, level)) pitchCandidateFrames = 0;
                         if (frequency > 0) {
-                            updatePitch(frequency, level, waveformBuffer, frameSize);
+                            updatePitch(frequency, level, null, 0);
                         } else if (tunerView != null) {
                             pitchCandidateFrames = 0;
-                            tunerView.setWaveform(level, waveformBuffer, frameSize);
+                            tunerView.setWaveform(level, null, 0);
                             updatePianoScanNoPitch(level);
                         }
                     });
@@ -2127,78 +2134,6 @@ public class MainActivity extends Activity {
         return (float) Math.min(1.0, Math.sqrt(sum / Math.max(1, size)) * 8.0);
     }
 
-    private double detectPitchYin(short[] input, int size) {
-        int n = Math.min(size, PITCH_BUFFER_SIZE);
-        double mean = 0;
-        for (int i = 0; i < n; i++) {
-            mean += input[i];
-        }
-        mean /= n;
-
-        double rms = 0;
-        double[] samples = new double[n];
-        for (int i = 0; i < n; i++) {
-            samples[i] = (input[i] - mean) / 32768.0;
-            rms += samples[i] * samples[i];
-        }
-        rms = Math.sqrt(rms / n);
-        if (rms < 0.01) {
-            return 0;
-        }
-
-        int tauMin = Math.max(2, (int) (SAMPLE_RATE / MAX_PIANO_FREQ));
-        int tauMax = Math.min(n - 2, (int) (SAMPLE_RATE / MIN_PIANO_FREQ));
-        double[] yin = new double[tauMax + 1];
-        for (int tau = 1; tau <= tauMax; tau++) {
-            double sum = 0;
-            for (int i = 0; i < n - tau; i++) {
-                double delta = samples[i] - samples[i + tau];
-                sum += delta * delta;
-            }
-            yin[tau] = sum;
-        }
-
-        double runningSum = 0;
-        int bestTau = -1;
-        for (int tau = 1; tau <= tauMax; tau++) {
-            runningSum += yin[tau];
-            yin[tau] = runningSum == 0 ? 1 : yin[tau] * tau / runningSum;
-            if (tau >= tauMin && yin[tau] < 0.12) {
-                while (tau + 1 <= tauMax && yin[tau + 1] < yin[tau]) {
-                    tau++;
-                }
-                bestTau = tau;
-                break;
-            }
-        }
-
-        if (bestTau < 0) {
-            double best = 1.0;
-            for (int tau = tauMin; tau <= tauMax; tau++) {
-                if (yin[tau] < best) {
-                    best = yin[tau];
-                    bestTau = tau;
-                }
-            }
-            if (best > 0.35) {
-                return 0;
-            }
-        }
-
-        double betterTau = bestTau;
-        if (bestTau > 1 && bestTau < tauMax) {
-            double left = yin[bestTau - 1];
-            double center = yin[bestTau];
-            double right = yin[bestTau + 1];
-            double divisor = 2 * (2 * center - left - right);
-            if (Math.abs(divisor) > 1e-9) {
-                betterTau = bestTau + (right - left) / divisor;
-            }
-        }
-
-        double frequency = SAMPLE_RATE / betterTau;
-        return frequency >= MIN_PIANO_FREQ && frequency <= MAX_PIANO_FREQ ? frequency : 0;
-    }
 
     private void updatePitch(double frequency, float level, short[] buffer, int size) {
         int midi = nearestMidi(frequency);
